@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>repvis · dense feature PCA</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="bg"></div>
+
+<header>
+  <div class="brand">
+    <span class="logo">◣◢</span>
+    <div>
+      <h1>repvis</h1>
+      <p class="sub">Dense representation PCA · DINOv2 · DINOv3 · V-JEPA 2.1</p>
+    </div>
+  </div>
+  <div class="gpu-badge" id="gpu-badge"></div>
+</header>
+
+<main>
+  <!-- ============ UPLOAD ============ -->
+  <section id="panel-upload" class="card">
+    <div id="dropzone" class="dropzone">
+      <input type="file" id="file-input" accept="video/*" hidden />
+      <div class="dz-inner">
+        <div class="dz-icon">⬆</div>
+        <div class="dz-title">Drop a video here</div>
+        <div class="dz-hint">or click to browse · mp4 / mov / webm / mkv</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <label class="field">
+        <span>Model</span>
+        <select id="model-select"></select>
+      </label>
+      <div class="field model-note" id="model-note"></div>
+
+      <div class="toggles">
+        <label class="chk"><input type="checkbox" id="opt-removebg" /> <span>Remove background</span></label>
+        <label class="chk"><input type="checkbox" id="opt-l2" /> <span>L2-normalize (angular)</span></label>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="adv-grid">
+          <label class="field"><span>Max resolution (long side, px)</span><input type="number" id="opt-maxside" value="1024" min="64" max="4096" step="16" /></label>
+          <label class="field"><span>Max frames</span><input type="number" id="opt-maxframes" value="600" min="8" max="4096" step="1" /></label>
+          <label class="field"><span>Target FPS</span><input type="number" id="opt-fps" value="24" min="1" max="60" step="1" /></label>
+        </div>
+      </details>
+
+      <button id="btn-process" class="btn-primary" disabled>Select a video to begin</button>
+    </div>
+  </section>
+
+  <!-- ============ PROGRESS ============ -->
+  <section id="panel-progress" class="card hidden">
+    <div class="prog-stage" id="prog-stage">Starting…</div>
+    <div class="prog-track"><div class="prog-fill" id="prog-fill"></div></div>
+    <div class="prog-msg" id="prog-msg"></div>
+  </section>
+
+  <!-- ============ RESULT ============ -->
+  <section id="panel-result" class="card hidden">
+    <div class="result-meta" id="result-meta"></div>
+    <div class="stage">
+      <figure class="vwrap">
+        <figcaption>Original</figcaption>
+        <video id="vid-orig" playsinline muted></video>
+      </figure>
+      <figure class="vwrap">
+        <figcaption>PCA features</figcaption>
+        <video id="vid-pca" playsinline muted></video>
+      </figure>
+    </div>
+
+    <div class="transport">
+      <button id="btn-play" class="tbtn" title="Play / Pause">▶</button>
+      <span class="time" id="time-cur">0:00</span>
+      <input type="range" id="seek" class="seek" min="0" max="1000" value="0" step="1" />
+      <span class="time" id="time-dur">0:00</span>
+      <label class="speed">
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </label>
+      <button id="btn-loop" class="tbtn ghost" title="Loop">↻</button>
+      <button id="btn-reset" class="tbtn ghost" title="New video">＋ New</button>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

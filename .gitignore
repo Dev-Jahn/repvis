@@ -1,0 +1,7 @@
+.venv/
+jobs/
+__pycache__/
+*.pyc
+.DS_Store
+checkpoints/
+models_hf/
