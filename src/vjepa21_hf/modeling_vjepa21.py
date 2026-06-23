@@ -245,19 +245,14 @@ class VJEPA21Embeddings(nn.Module):
     ) -> tuple[torch.Tensor, str]:
         """
         Args:
-            pixel_values_videos: `(B, T, H, W, C)` or `(B, C, T, H, W)`.
+            pixel_values_videos: channels-first `(B, C, T, H, W)` video
+                (or `(B, C, H, W)` image). This is the required layout — it maps
+                directly onto the Conv3d/Conv2d patch embedder. Permute upstream
+                if your data is channels-last.
         Returns:
             embeddings: `(B, N, hidden_size)`.
             mode: "img" or "video".
         """
-        # Ensure (B, C, T, H, W)
-        if pixel_values_videos.ndim == 5 and pixel_values_videos.shape[-1] in (1, 3):
-            # (B, T, H, W, C) -> (B, C, T, H, W)
-            pixel_values_videos = pixel_values_videos.permute(0, 4, 1, 2, 3)
-        elif pixel_values_videos.ndim == 5 and pixel_values_videos.shape[1] not in (1, 3):
-            # (B, T, H, W, C) where T > 3
-            pixel_values_videos = pixel_values_videos.permute(0, 4, 1, 2, 3)
-
         target_dtype = self.patch_embeddings.proj.weight.dtype
         pixel_values_videos = pixel_values_videos.to(dtype=target_dtype)
 
@@ -562,15 +557,11 @@ class VJEPA21Encoder(nn.Module):
     ) -> VJEPA21EncoderOutput:
         embeddings, mode = self.embeddings(pixel_values_videos)
 
-        # Compute spatial/temporal grid sizes for RoPE
+        # Compute spatial/temporal grid sizes for RoPE (channels-first contract)
         if pixel_values_videos.ndim == 5:
-            # After embedding permutation: (B, C, T, H, W)
-            if pixel_values_videos.shape[-1] in (1, 3):
-                B, T_raw, H, W, C = pixel_values_videos.shape
-            else:
-                B, C, T_raw, H, W = pixel_values_videos.shape
+            B, C, T_raw, H, W = pixel_values_videos.shape   # (B, C, T, H, W)
         else:
-            B, C, H, W = pixel_values_videos.shape
+            B, C, H, W = pixel_values_videos.shape          # (B, C, H, W) image
             T_raw = 1
 
         is_image = (
@@ -965,9 +956,8 @@ class VJEPA21Model(VJEPA21PreTrainedModel):
     ) -> VJEPA21ModelOutput:
         """
         Args:
-            pixel_values_videos: Video tensor. Accepted shapes:
-                - `(B, T, H, W, C)` channels-last
-                - `(B, C, T, H, W)` channels-first
+            pixel_values_videos: channels-first video `(B, C, T, H, W)`
+                (or image `(B, C, H, W)`). Permute upstream if channels-last.
             context_mask: List of `(B, K)` index tensors for context tokens.
             target_mask: List of `(B, K)` index tensors for target tokens.
             skip_predictor: If True, skip predictor forward (encoder only).
@@ -1014,10 +1004,7 @@ class VJEPA21Model(VJEPA21PreTrainedModel):
 
     def _detect_mode(self, pixel_values_videos: torch.Tensor) -> str:
         if pixel_values_videos.ndim == 5:
-            if pixel_values_videos.shape[-1] in (1, 3):
-                T = pixel_values_videos.shape[1]
-            else:
-                T = pixel_values_videos.shape[2]
+            T = pixel_values_videos.shape[2]   # (B, C, T, H, W)
         else:
             T = 1
         if (
