@@ -39,6 +39,29 @@ def _quantile(x: torch.Tensor, qs) -> torch.Tensor:
     return torch.quantile(x, torch.tensor(qs, device=x.device, dtype=x.dtype))
 
 
+@torch.inference_mode()
+def _otsu_threshold(v: torch.Tensor, bins: int = 256) -> torch.Tensor:
+    """Otsu threshold: the value that best splits a (bimodal) 1-D distribution.
+
+    Used to separate foreground/background along PC1 — a data-driven valley, not
+    a fixed 50% median split.
+    """
+    v = _subsample(v, 200_000)
+    lo, hi = v.min(), v.max()
+    if (hi - lo) < 1e-9:
+        return lo
+    hist = torch.histc(v, bins=bins, min=float(lo), max=float(hi))
+    p = hist / hist.sum().clamp_min(1.0)
+    centers = torch.linspace(float(lo), float(hi), bins, device=v.device)
+    w0 = torch.cumsum(p, 0)                       # weight of "below" class
+    w1 = (1.0 - w0).clamp_min(1e-12)
+    csum = torch.cumsum(p * centers, 0)
+    mu0 = csum / w0.clamp_min(1e-12)
+    mu1 = (csum[-1] - csum) / w1
+    sigma_b = w0 * w1 * (mu0 - mu1) ** 2          # between-class variance
+    return centers[int(torch.argmax(sigma_b))]
+
+
 @dataclass
 class PCAState:
     l2norm: bool
@@ -76,12 +99,15 @@ def fit_pca_state(fit_tokens: torch.Tensor, *, remove_bg: bool = False, l2norm: 
     fg_above = True
     fg = None
     if remove_bg:
-        c1, m1 = _fit(x, 1, x.shape[0])
-        pc1 = (x - m1) @ c1[0]
-        thr = _quantile(pc1, [0.5])[0]
-        above = pc1 > thr
-        fg_above = bool(above.float().mean() <= 0.5)  # object = minority side
-        fg = above if fg_above else ~above
+        _c1, _m1 = _fit(x, 1, x.shape[0])
+        pc1 = (x - _m1) @ _c1[0]
+        _thr = _otsu_threshold(pc1)                    # data-driven fg/bg split (not 50%)
+        above = pc1 > _thr
+        fg_above = bool(above.float().mean() <= 0.5)   # foreground = minority side
+        cand = above if fg_above else ~above
+        # only enable masking on a non-degenerate split; else keep everything
+        if cand.float().mean() >= 0.02:
+            fg, c1, m1, thr = cand, _c1, _m1, _thr
 
     src = x[fg] if fg is not None else x
     comps, mean = _fit(src, 3, src.shape[0])
