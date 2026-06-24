@@ -36,10 +36,7 @@ inputs trade train/test resolution match for spatial detail.
 ## Setup & run
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install torch torchvision --torch-backend=cu128   # Blackwell; pick your CUDA
-uv pip install torchcodec av "transformers>=4.56" accelerate safetensors \
-  huggingface_hub pillow numpy fastapi "uvicorn[standard]" python-multipart
+uv sync                        # create .venv + install deps (PyTorch cu130 by default)
 
 ./run.sh                       # http://127.0.0.1:8000
 HOST=0.0.0.0 ./run.sh          # bind all interfaces (no auth — use with care)
@@ -47,6 +44,9 @@ PORT=9000 ./run.sh             # custom port
 REPVIS_GPUS=0,1 ./run.sh       # restrict GPUs
 REPVIS_COMPILE=1 ./run.sh      # torch.compile (max throughput, slow warmup)
 ```
+
+For a different CUDA build, change the `pytorch-cu130` index URL in `pyproject.toml`
+(e.g. `…/whl/cu128` or `…/whl/cpu`) and re-run `uv sync`.
 
 Drag a video onto the page, pick a model, hit **Visualize**. Watch the progress,
 then scrub the synced original / PCA players.

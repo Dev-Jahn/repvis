@@ -1,0 +1,37 @@
+[project]
+name = "repvis"
+version = "0.1.0"
+description = "Visualize dense self-supervised features (DINOv2/v3, V-JEPA 2.1) as a PCA-RGB video, side-by-side with the original."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchcodec",
+    "av",
+    "transformers>=4.56",
+    "accelerate",
+    "safetensors",
+    "huggingface-hub",
+    "numpy",
+    "pillow",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+]
+
+# Run from the repo directory (uvicorn repvis.server:app); not built/installed.
+[tool.uv]
+package = false
+
+# PyTorch CUDA 13.0 wheels (Blackwell sm_120). Switch the URL for other CUDA
+# versions, e.g. .../whl/cu128 or .../whl/cpu.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchcodec = { index = "pytorch-cu130" }
