@@ -5,7 +5,10 @@ backbones as a PCA-RGB video, side-by-side with the original.
 
 Each spatial (DINO) / spatio-temporal (V-JEPA) patch token is projected onto its
 top-3 principal components (one PCA fit over the whole clip, so colors stay
-temporally consistent) and shown as RGB.
+temporally consistent) and shown as RGB. Results land in a **matrix workspace**:
+rows are source videos, columns are models, so you can compare backbones on one
+clip and (with **joint PCA**) compare clips under one shared basis — the same
+color then means the same feature direction *across* videos.
 
 ## Models
 
@@ -48,8 +51,18 @@ REPVIS_COMPILE=1 ./run.sh      # torch.compile (max throughput, slow warmup)
 For a different CUDA build, change the `pytorch-cu130` index URL in `pyproject.toml`
 (e.g. `…/whl/cu128` or `…/whl/cpu`) and re-run `uv sync`.
 
-Drag a video onto the page, pick a model, hit **Visualize**. Watch the progress,
-then scrub the synced original / PCA players.
+### Using the workspace
+
+1. **Drop video(s)** onto the tray. Uploads are content-addressed, so the same
+   file is stored (and processed) once — re-running never re-uploads or grows disk.
+2. **Select** one or more sources, pick a **model**, hit **Run**. Selecting ≥2
+   sources runs a shared-basis **joint PCA** (cross-video colors) automatically.
+3. Each result lands in the **matrix** (rows = sources, cols = models). Re-run a
+   source with another model to add a column and compare side by side; everything
+   plays from one synced transport.
+4. Per PCA cell, the **PC→RGB** control swaps which principal component drives each
+   color channel (the 6 permutations) plus optional per-channel invert — applied
+   live as a browser filter, no re-encode.
 
 ## Performance & memory
 
@@ -58,7 +71,10 @@ so peak GPU memory is O(one chunk), independent of video length — a 1-hour 108
 clip at 6000 frames runs in the same ~6 GB as a 256-frame clip. Per chunk:
 decode→extract→offload features to host RAM; the PCA basis is fit once on a capped
 token subsample (temporally consistent colors); then project+encode chunk-by-chunk.
-Features for the whole job live in CPU RAM (bounded by `max_frames`).
+Features for the whole job live in CPU RAM (bounded by `max_frames`). A **joint**
+run must hold every source's features until the shared basis is fit, so host RAM
+there scales with the *total* frames across the selected sources — keep `max_frames`
+modest when jointly comparing many long clips.
 
 GPUs are chosen per job by free VRAM (`REPVIS_MIN_FREE_GB`, default 16), emptiest
 first, so busy GPUs on a shared box are skipped (never hardcodes `cuda:0`).
