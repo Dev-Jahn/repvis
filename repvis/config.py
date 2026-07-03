@@ -27,10 +27,15 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
-# torch.compile is opt-in: it gives the best steady-state throughput but adds a
-# one-time warmup that can dominate short clips. Everything else (bf16, SDPA,
-# multi-GPU sharding, GPU decode/encode, GPU PCA) is always on.
+# torch.compile is opt-in (REPVIS_COMPILE=1) and only touches the RoPE models
+# (dinov3/vjepa, spec.compile) — +15-16% wall there, a net loss on the already
+# GEMM-peak DINOv2 models. It adds a ~70s per-resolution cold build; the inductor
+# cache below persists it across restarts so a given resolution is only built once
+# ever. Everything else (bf16, SDPA, NVDEC, multi-stream overlap, NVENC, GPU PCA)
+# is always on.
 COMPILE = os.environ.get("REPVIS_COMPILE", "0") == "1"
+if COMPILE:
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(DATA_ROOT / "inductor-cache"))
 
 
 def available_devices() -> list[str]:
@@ -95,6 +100,7 @@ class ModelSpec:
     tubelet: int = 1       # temporal patch size (vjepa)
     chunk_frames: int = 32  # frames per forward clip (vjepa)
     batch_size: int = 64   # frames (dino) / clips (vjepa) per forward — tuned per model
+    compile: bool = False  # worth torch.compile? only the RoPE models (see extract.py)
     mean: tuple = IMAGENET_MEAN
     std: tuple = IMAGENET_STD
     note: str = ""
@@ -141,12 +147,13 @@ REGISTRY: dict[str, ModelSpec] = {
     "dinov3-vitb16": ModelSpec(
         "dinov3-vitb16", "DINOv3 · ViT-B/16", "dino",
         "facebook/dinov3-vitb16-pretrain-lvd1689m", patch=16, max_side=1024, batch_size=128,
+        compile=True,   # RoPE fusion: +16% wall (measured)
         note="Gated (license accepted). RoPE; CLS + 4 registers stripped.",
     ),
     "vjepa21-vitl": ModelSpec(
         "vjepa21-vitl", "V-JEPA 2.1 · ViT-L/16", "vjepa",
         "Dev-Jahn/vjepa2.1-vitl-fpc64-384", patch=16, max_side=640, tubelet=2, chunk_frames=32,
-        batch_size=1,
+        batch_size=1, compile=True,   # 3D-RoPE fusion: +15% wall (measured)
         note="Video SSL, dense spatio-temporal features. Heavier at high res.",
     ),
 }

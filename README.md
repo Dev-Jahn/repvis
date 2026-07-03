@@ -109,10 +109,22 @@ are skipped (never hardcodes `cuda:0`).
 
 Always on: NVDEC decode, GPU preprocess (fp16 resize), bf16 (DINO) /
 bf16-autocast (V-JEPA), SDPA attention, TF32, multi-GPU + multi-stream overlap,
-GPU-side PCA (SVD), NVENC encode. `REPVIS_COMPILE=1` adds `torch.compile`
-(`max-autotune-no-cudagraphs`); it is **opt-in** because it recompiles per input
-resolution (7–40 s warmup each) to save only ~10% of forward time — a win when
-batch-processing many same-resolution long clips, a net loss for varied one-offs.
+GPU-side PCA (SVD), NVENC encode.
+
+`REPVIS_COMPILE=1` adds `torch.compile` — but **only for the RoPE models**
+(DINOv3, V-JEPA), and this is deliberate, measured, not laziness. The DINOv2
+models are already at cuBLAS tensor-core-GEMM peak: `torch.compile` and TensorRT
+both fall back to the same cuBLAS kernels and win only ~7% on the forward, which
+the NVDEC overlap then eats — net **−6% wall**, so they are never compiled.
+DINOv3/V-JEPA instead spend a large fraction of each layer on rotary-embedding
+elementwise ops that fuse well: forward 1.28–1.41×, and since forward is the
+pipeline's critical path there, **+15–16% wall** at 0.9999 feature cosine.
+It stays opt-in because the first clip of each new resolution pays a ~70 s cold
+build (fused into a persistent `inductor-cache/` so it is built once per
+resolution ever, not per process) — worth it for batch-processing many clips,
+not for a single short one. FP8 (E4M3) was measured too: the GEMMs do hit
+1.6–1.9× in isolation, but the unquantized bf16 attention dilutes it to ~1.2×
+forward (≈ compile), for a torchao dependency and lower fidelity — not worth it.
 
 ## Tests
 

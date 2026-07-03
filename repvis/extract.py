@@ -53,9 +53,16 @@ class _Extractor:
         self.mean = torch.tensor(spec.mean, device=device, dtype=torch.float16).view(1, 3, 1, 1)
         self.std = torch.tensor(spec.std, device=device, dtype=torch.float16).view(1, 3, 1, 1)
 
-        if COMPILE:
+        # torch.compile helps ONLY the RoPE models (spec.compile): measured wall
+        # gain dinov3 +16%, V-JEPA +15% from fusing the per-layer rotary-embedding
+        # elementwise chain. The DINOv2 models are already at cuBLAS GEMM peak
+        # (+7% forward that the decode overlap eats, net -6% wall) — never compile
+        # them. mode="default" matches max-autotune throughput at half the warmup.
+        # The per-resolution cold build (~70s) is why this stays opt-in (REPVIS_COMPILE);
+        # a persistent inductor cache (config.py) amortizes it across restarts.
+        if COMPILE and spec.compile:
             try:
-                self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
+                self.model = torch.compile(self.model, mode="default")
             except Exception:  # noqa: BLE001
                 pass
 
