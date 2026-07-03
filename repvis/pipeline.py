@@ -1,32 +1,44 @@
-"""End-to-end job, streamed in bounded chunks so peak GPU memory is O(one chunk).
+"""End-to-end group processing, fully pipelined so the GPU never idles.
 
-A "group" is one or more source videos processed together. With >1 source the
-PCA basis is fit once over the *pooled* token sample from every source (equal
-per-source contribution), so the same color means the same feature direction
-*across* videos — that's the cross-video semantic comparison. A single source is
-just a group of one (identical to per-video PCA).
+A "group" is one or more source videos processed together under ONE shared PCA
+basis (joint PCA: same color = same feature direction across videos; a single
+source is a group of one).
 
-Phase 1: for each source, decode -> extract features per chunk -> spill each
-         chunk to disk (the run dir), gathering a capped token subsample into
-         one shared fit buffer. Host RAM stays O(one chunk) even for joint runs.
-Phase 2: fit the shared PCA once (temporally + cross-video consistent colors),
-         then stream the spilled chunks back to project + render + encode each
-         source's own video, deleting each spill file as it is consumed.
+Work is split into *units* — contiguous segments of a source's sampled frames —
+bin-packed across the available GPUs. Each unit runs a self-contained phase-1
+pipeline on its device:
+
+    [decode thread]  NVDEC -> uint8 RGB chunks on the GPU   (queue, depth 2)
+    [worker thread]  preprocess + model forward (bf16)      -> fp16 features
+    [offload thread] features -> host RAM cache             (queue, depth 2)
+
+so decode, compute and D2H run concurrently. After the shared PCA fit, phase 2
+renders each source on its own GPU:
+
+    [prefetch thread] host cache -> GPU                     (queue, depth 2)
+    [render thread]   project -> upsample -> RGB
+    [NvencSink]       RGB->NV12 on GPU -> pinned D2H -> ffmpeg h264_nvenc
+                      (csc/copy/encode overlap the render loop internally)
+
+Peak GPU memory is O(one chunk); host RAM holds the fp16 feature cache
+(bounded by max_frames per source).
 """
 from __future__ import annotations
 
 import math
-from pathlib import Path
+import queue
+import threading
 
 import torch
 import torch.nn.functional as F
 
 from .config import REGISTRY, STREAM_CHUNK, proc_hw, select_devices
-from .extract import extract_features
+from .extract import extract_unit_chunk, warm_model
 from .pca import fit_pca_state, project_chunk
-from .video_io import VideoSource, encode_rgb_frames
+from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
 
-_FIT_MAX = 300_000  # max tokens used to fit the PCA basis (pooled across sources)
+_FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
+_MIN_SEG = 192       # don't split a source into segments smaller than this
 
 
 def _even(v: int) -> int:
@@ -34,132 +46,454 @@ def _even(v: int) -> int:
     return max(2, v - (v % 2))
 
 
+class _Cancel(Exception):
+    pass
+
+
+class _Group:
+    """Shared mutable state for one run_group call."""
+
+    def __init__(self, emit, total_frames: int):
+        self.emit = emit
+        self.total = total_frames
+        self.lock = threading.Lock()
+        self.done_extract = 0
+        self.done_render = 0
+        self.error: BaseException | None = None
+        self.cancel = threading.Event()
+
+    def fail(self, e: BaseException):
+        with self.lock:
+            if self.error is None:
+                self.error = e
+        self.cancel.set()
+
+    def check(self):
+        if self.cancel.is_set():
+            raise _Cancel()
+
+    def tick_extract(self, k: int):
+        with self.lock:
+            self.done_extract += k
+            d = self.done_extract
+        self.emit(stage="extracting", progress=0.05 + 0.50 * d / self.total,
+                  message=f"Extracting dense features… {int(100 * d / self.total)}%  ({d}/{self.total})")
+
+    def tick_render(self, k: int):
+        with self.lock:
+            self.done_render += k
+            d = self.done_render
+        self.emit(stage="encoding", progress=0.62 + 0.36 * d / self.total,
+                  message=f"Rendering PCA video… {int(100 * d / self.total)}%")
+
+
+def _plan_units(sources: list[dict], ndev: int, align: int) -> list[dict]:
+    """Split sources into contiguous index segments and bin-pack them onto
+    devices (largest first, least-loaded device), so decode+extract scale
+    across GPUs even for a single long video."""
+    units = []
+    for s in sources:
+        n = len(s["indices"])
+        # Several units per device: NVDEC sessions run in parallel (the card
+        # has multiple decode engines), and unit B's decode overlaps unit A's
+        # extraction on the same device. Segments align to the model's clip
+        # length so V-JEPA never pads mid-video.
+        nseg = max(1, min(math.ceil(4 * ndev / len(sources)), n // _MIN_SEG))
+        per = -(-math.ceil(n / nseg) // align) * align
+        for k in range(0, n, per):
+            units.append({"src": s, "lo": k, "hi": min(n, k + per)})
+    load = [0] * ndev
+    for u in sorted(units, key=lambda u: u["lo"] - u["hi"]):   # largest first
+        d = min(range(ndev), key=lambda i: load[i])
+        u["dev_idx"] = d
+        load[d] += u["hi"] - u["lo"]
+    return units
+
+
+# ---- cancellation-safe queue plumbing --------------------------------------
+# Every producer/consumer handoff below is bounded and cancel-aware: a thread
+# blocked on a full/empty queue must ALWAYS wake up when the group is cancelled
+# (g.fail from any thread) or its stop Event fires, so one thread's death can
+# never wedge another forever. This is the invariant that keeps the pipeline
+# deadlock-free — see _cput/_cget/_drain.
+_CANCELLED = object()
+
+
+def _cput(q: queue.Queue, item, g: _Group, *stops: threading.Event) -> bool:
+    """Bounded put that yields to cancellation. True if enqueued, False if we
+    bailed because the group was cancelled or a stop fired."""
+    while not (g.cancel.is_set() or any(s.is_set() for s in stops)):
+        try:
+            q.put(item, timeout=0.2)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _cget(q: queue.Queue, g: _Group):
+    """Bounded get that yields to cancellation. Returns _CANCELLED if the group
+    was cancelled while the queue stayed empty."""
+    while True:
+        try:
+            return q.get(timeout=0.2)
+        except queue.Empty:
+            if g.cancel.is_set():
+                return _CANCELLED
+
+
+def _drain(q: queue.Queue):
+    try:
+        while True:
+            q.get_nowait()
+    except queue.Empty:
+        pass
+
+
+# ------------------------------------------------------------------- phase 1
+# Stream discipline (measured, not theoretical): torchcodec's CUDA decoder
+# synchronizes against the DEFAULT stream — any compute queued there starves
+# decode by >10x. So the default stream is reserved for torchcodec, model
+# compute runs on a side stream, and the feature D2H on another. Handoffs
+# carry a CUDA event (consumers wait on the event, never the device) and
+# cross-stream tensors are record_stream()-ed so the caching allocator
+# doesn't recycle them early.
+
+def _start_decode(unit: dict, dev: str, chunk: int, align: int, g: _Group):
+    """Kick off a unit's NVDEC decode thread (bounded queue -> self-throttled).
+
+    All of a device's units decode concurrently: the GPU has multiple NVDEC
+    engines, and unit B's decode overlaps unit A's extraction.
+    """
+    src = unit["src"]
+    indices = src["indices"][unit["lo"]:unit["hi"]]
+    vs = GpuVideoSource(src["input"], dev, indices)
+    dq: queue.Queue = queue.Queue(maxsize=2)
+    stop = threading.Event()
+
+    def decode_loop():   # default stream: torchcodec only
+        try:
+            torch.cuda.set_device(dev)
+            for _i, frames in vs.iter_chunks(chunk, align):
+                if stop.is_set() or g.cancel.is_set():
+                    break
+                ev = torch.cuda.Event()
+                ev.record()
+                if not _cput(dq, (frames, ev), g, stop):
+                    break
+        except BaseException as e:  # noqa: BLE001
+            g.fail(e)
+        finally:
+            _cput(dq, None, g, stop)
+
+    dt = threading.Thread(target=decode_loop, daemon=True)
+    dt.start()
+    unit["_decode"] = (dt, vs, stop)
+    unit["_dq"] = dq
+    unit["cache"] = []
+
+
+def _stop_decode(unit: dict):
+    """Stop + join a unit's decode thread if it's still around (idempotent)."""
+    dec = unit.get("_decode")
+    if not dec:
+        return
+    dt, vs, stop = dec
+    stop.set()
+    dq = unit.get("_dq")
+    if dq is not None:
+        _drain(dq)              # unblock a decode thread parked on a full queue
+    dt.join()
+    vs.close()
+    unit["_decode"] = unit["_dq"] = None
+
+
+def _offload_loop(oq: queue.Queue, dev: str, g: _Group):
+    """Shared per-device D2H worker: (unit, feats, event) -> pinned host cache."""
+    try:
+        torch.cuda.set_device(dev)
+        s_off = torch.cuda.Stream()
+        while True:
+            item = _cget(oq, g)
+            if item is None or item is _CANCELLED:
+                return
+            unit, feats, ev = item
+            s_off.wait_event(ev)                     # after the producer kernels
+            feats.record_stream(s_off)
+            with torch.cuda.stream(s_off):
+                pinned = torch.empty(feats.shape, dtype=feats.dtype, pin_memory=True)
+                pinned.copy_(feats, non_blocking=True)
+            s_off.synchronize()                      # feats stays referenced until here
+            unit["cache"].append(pinned)
+            del feats
+    except BaseException as e:  # noqa: BLE001
+        g.fail(e)
+
+
+def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq: queue.Queue):
+    """Drain a unit's decode queue through the model; hand features to the
+    device's offload worker."""
+    dq = unit["_dq"]
+    fit_parts: list[torch.Tensor] = []
+    n_chunks = math.ceil((unit["hi"] - unit["lo"]) / chunk)
+    quota = max(1, math.ceil(unit["fit_quota"] / max(n_chunks, 1)))
+    s_cmp = torch.cuda.Stream(device=dev)
+    try:
+        with torch.cuda.stream(s_cmp):
+            while True:
+                item = _cget(dq, g)
+                if item is None or item is _CANCELLED:
+                    break
+                frames, ev = item
+                s_cmp.wait_event(ev)                     # decode done for this chunk
+                frames.record_stream(s_cmp)
+                feats = extract_unit_chunk(spec, frames, dev, unit["proc"], unit["grid"], bs)
+                flat = feats.reshape(-1, feats.shape[-1])
+                take = min(flat.shape[0], quota)
+                sel = torch.randperm(flat.shape[0], device=flat.device)[:take]
+                fit_parts.append(flat[sel].float())
+                fev = torch.cuda.Event()
+                fev.record(s_cmp)
+                if not _cput(oq, (unit, feats, fev), g):   # offload dead/cancelled
+                    break
+                g.tick_extract(int(frames.shape[0]))
+                del frames, feats, flat, sel
+    finally:
+        _stop_decode(unit)      # always stop+join this unit's decoder
+    g.check()
+    with torch.cuda.stream(s_cmp):
+        unit["fit"] = torch.cat(fit_parts, 0).to("cpu") if fit_parts else None
+    s_cmp.synchronize()
+
+
+# ------------------------------------------------------------------- phase 2
+def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
+    """Project + upsample + encode one source from its host feature cache.
+
+    Same stream discipline as phase 1: render math on a side stream, the
+    default stream stays reserved for torchcodec (NVENC submit).
+    """
+    torch.cuda.set_device(dev)
+    meta = src["meta"]
+    ow, oh = _even(meta["width"]), _even(meta["height"])
+    chunks = [c for u in src["units"] for c in u["cache"]]   # units are in order
+    for u in src["units"]:
+        u["cache"] = None
+
+    pq: queue.Queue = queue.Queue(maxsize=2)
+    stop_pre = threading.Event()
+
+    def prefetch_loop():   # pinned host -> GPU, own stream
+        try:
+            torch.cuda.set_device(dev)
+            s_pre = torch.cuda.Stream()
+            with torch.cuda.stream(s_pre):
+                for i, c in enumerate(chunks):
+                    if stop_pre.is_set() or g.cancel.is_set():
+                        break
+                    gpu = c.to(dev, non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record(s_pre)
+                    if not _cput(pq, (gpu, ev), g, stop_pre):
+                        break
+                    chunks[i] = None
+        except BaseException as e:  # noqa: BLE001
+            g.fail(e)
+        finally:
+            _cput(pq, None, g, stop_pre)
+
+    pt = threading.Thread(target=prefetch_loop, daemon=True)
+    s_r = torch.cuda.Stream(device=dev)
+    default = torch.cuda.default_stream(dev)
+    sink = None
+    pt_started = False
+    try:
+        # NOTE: state.to(dev) and GpuEncoder() must be inside the try so the
+        # finally always runs (either can raise: H2D OOM / NVENC init failure).
+        st = state.to(dev)
+        sink = GpuEncoder(src["out"], ow, oh, src["fps_out"], dev)
+        pt.start()
+        pt_started = True
+        while True:
+            item = _cget(pq, g)
+            if item is _CANCELLED:
+                raise _Cancel()
+            if item is None:
+                break
+            cf, ev = item
+            s_r.wait_event(ev)
+            with torch.cuda.stream(s_r):
+                cf.record_stream(s_r)
+                rgb = project_chunk(cf, st).permute(0, 3, 1, 2)   # (k,3,gh,gw) float
+                k = rgb.shape[0]
+                for j in range(0, k, 24):
+                    up = F.interpolate(rgb[j:j + 24], size=(oh, ow), mode="bilinear", align_corners=False)
+                    up = (up.clamp_(0, 1) * 255).round_().to(torch.uint8).contiguous()
+                    rev = torch.cuda.Event()
+                    rev.record(s_r)
+                    default.wait_event(rev)               # encoder consumes on default
+                    up.record_stream(default)
+                    sink.submit(up)
+            g.tick_render(k)
+            del cf, rgb
+        sink.close()
+    except BaseException:
+        if sink is not None:
+            sink.abort()
+        raise
+    finally:
+        stop_pre.set()
+        _drain(pq)               # unblock prefetch parked on a full queue
+        if pt_started:
+            pt.join()
+    emit_done(src)
+
+
+# ---------------------------------------------------------------------- main
 def run_group(items: list[dict], model_key: str, opts: dict, emit):
     """Process a group of sources with one shared PCA basis.
 
     `items`: list of {"run_id", "source_id", "input": Path, "out": Path}.
-    `emit`: group-level progress; per-source completion is reported via
-            emit(run_id=..., run_status="done", result={...}).
     """
     spec = REGISTRY[model_key]
     devices = select_devices()
-    primary = devices[0]
     ndev = len(devices)
     max_side = int(opts.get("max_side") or 0) or spec.max_side
-    bs = int(opts.get("batch_size", 32))
     fps = float(opts.get("fps") or 24.0)
     max_frames = max(1, int(opts.get("max_frames") or 900))
 
     chunk = max(1, STREAM_CHUNK)
-    if spec.family == "vjepa":  # align chunk to clip length
+    if spec.family == "vjepa":   # align chunk to clip length
         chunk = max(spec.chunk_frames, (chunk // spec.chunk_frames) * spec.chunk_frames)
 
-    nsrc = len(items)
-    per_source_fit = max(1, _FIT_MAX // nsrc)  # equal contribution to the shared basis
-
-    # Decode every source up front so we know total frame count for progress.
+    # ---- probe sources, plan work ----
     emit(stage="decoding", progress=0.02, message="Opening video(s)…")
-    srcs = []
+    sources = []
     total_n = 0
     for it in items:
-        s = VideoSource(it["input"], target_fps=fps, max_frames=max_frames)
-        if s.n == 0:
-            s.close()
-            raise RuntimeError(f"no frames decoded ({it['source_id']})")
-        srcs.append((it, s))
-        total_n += s.n
+        meta = probe_video(it["input"])
+        indices = compute_indices(meta["n_total"], meta["src_fps"], fps, max_frames)
+        if not indices:
+            raise RuntimeError(f"no frames to decode ({it['source_id']})")
+        ph, pw, gh, gw = proc_hw(meta["height"], meta["width"], spec.patch, max_side)
+        sources.append({"it": it, "input": it["input"], "out": it["out"], "meta": meta,
+                        "indices": indices, "grid": (gh, gw), "proc": (ph, pw),
+                        "fps_out": len(indices) / meta["duration"] if meta["duration"] > 0 else meta["src_fps"],
+                        "units": []})
+        total_n += len(indices)
 
-    multi = nsrc > 1
+    align = spec.chunk_frames if spec.family == "vjepa" else 1
+    units = _plan_units(sources, ndev, align)
+    per_source_fit = max(1, _FIT_MAX // len(sources))
+    for u in units:
+        s = u["src"]
+        u["proc"], u["grid"] = s["proc"], s["grid"]
+        u["fit_quota"] = max(1, per_source_fit * (u["hi"] - u["lo"]) // len(s["indices"]))
+        s["units"].append(u)
+    for s in sources:
+        s["units"].sort(key=lambda u: u["lo"])
+
+    bs = int(opts.get("batch_size") or 0) or spec.batch_size
+    multi = len(sources) > 1
     emit(stage="extracting", progress=0.05,
-         message=(f"{nsrc} source(s) · {total_n} frames · {spec.label} · {ndev} GPU(s)"
+         message=(f"{len(sources)} source(s) · {total_n} frames · {spec.label} · {ndev} GPU(s)"
                   + (" · shared (joint) PCA" if multi else "")))
 
-    # ---- Phase 1: extract every source, spill features to disk, pool fit sample ----
-    # The shared basis must see every source before any projection, so per-source
-    # feature chunks are spilled to the run dir (fp16) instead of held in host RAM.
-    # RAM stays O(one chunk); disk usage is transient and freed as phase 2 consumes.
-    per_src: list[dict] = []
-    src_fit: list[torch.Tensor] = []      # one pooled (mi, D) fit sample per source
-    done_frames = 0
-    for it, s in srcs:
-        meta = s.meta
-        proc_h, proc_w, gh, gw = proc_hw(meta["height"], meta["width"], spec.patch, max_side)
-        n = s.n
-        n_chunks = math.ceil(n / chunk)
-        per_chunk_quota = max(1, math.ceil(per_source_fit / n_chunks))
-        spill_dir: Path = it["out"].parent
-        feat_paths: list[Path] = []           # spilled fp16 (k, gh, gw, D) chunks
-        parts: list[torch.Tensor] = []
-        for _start, frames in s.iter_chunks(chunk):
-            cf = extract_features(spec, frames, devices, (proc_h, proc_w), (gh, gw), bs, lambda _f: None)
-            flat = cf.reshape(-1, cf.shape[-1])
-            take = min(flat.shape[0], per_chunk_quota)
-            sel = torch.randperm(flat.shape[0], device=flat.device)[:take]
-            parts.append(flat[sel].float())
-            p = spill_dir / f"feat_{len(feat_paths):04d}.pt"
-            torch.save(cf.to("cpu"), p)
-            feat_paths.append(p)
-            done_frames += int(frames.shape[0])
-            emit(stage="extracting", progress=0.05 + 0.55 * done_frames / total_n,
-                 message=f"Extracting dense features… {int(100 * done_frames / total_n)}%  ({done_frames}/{total_n})")
-            del cf, flat, sel
-        s.close()
-        src_fit.append(torch.cat(parts, 0))
-        per_src.append({"it": it, "meta": meta, "grid": (gw, gh), "proc": (proc_w, proc_h),
-                        "n": n, "feat_paths": feat_paths})
+    g = _Group(emit, total_n)
 
-    # ---- Fit ONE PCA basis over the pooled sample (shared colors across sources) ----
-    emit(stage="pca", progress=0.62,
+    # ---- warm models on every device that has work (parallel, once) ----
+    used = sorted({devices[u["dev_idx"]] for u in units})
+    threads = [threading.Thread(target=warm_model, args=(spec, d), daemon=True) for d in used]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # ---- phase 1: per-device workers — decode all units ahead, extract in order ----
+    def dev_worker(di: int):
+        dev = devices[di]
+        mine = [u for u in units if u["dev_idx"] == di]
+        oq: queue.Queue = queue.Queue(maxsize=2)
+        ot = threading.Thread(target=_offload_loop, args=(oq, dev, g), daemon=True)
+        ot_started = False
+        try:
+            torch.cuda.set_device(dev)
+            ot.start()
+            ot_started = True
+            for u in mine:
+                _start_decode(u, dev, chunk, align, g)
+            for u in mine:
+                g.check()
+                _extract_unit(u, spec, dev, chunk, bs, g, oq)
+        except _Cancel:
+            pass
+        except BaseException as e:  # noqa: BLE001
+            g.fail(e)
+        finally:
+            for u in mine:                  # stop+join any decoder _extract_unit didn't reach
+                _stop_decode(u)
+            if ot_started:
+                if not g.cancel.is_set():    # clean shutdown; on cancel offload exits via _cget
+                    _cput(oq, None, g)
+                ot.join()
+
+    workers = [threading.Thread(target=dev_worker, args=(i,), daemon=True)
+               for i in range(ndev) if any(u["dev_idx"] == i for u in units)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    if g.error:
+        raise g.error
+
+    # ---- shared PCA fit (equal per-source contribution) ----
+    emit(stage="pca", progress=0.58,
          message="Fitting shared PCA basis…" if multi else "Fitting PCA basis…")
-    # Enforce equal per-source contribution: a small/short source must not be
-    # out-weighted by a long one, or the shared basis (and thus cross-video colors)
-    # would be dominated by the larger source. Subsample every source down to the
-    # smallest available token count before pooling.
-    if len(src_fit) > 1:
+    primary = devices[0]
+    src_fit = []
+    for s in sources:
+        parts = [u["fit"] for u in s["units"] if u["fit"] is not None]
+        for u in s["units"]:
+            u["fit"] = None
+        src_fit.append(torch.cat(parts, 0))
+    if len(src_fit) > 1:   # a long source must not out-weight a short one
         m = min(int(t.shape[0]) for t in src_fit)
-        src_fit = [t[torch.randperm(t.shape[0], device=t.device)[:m]] for t in src_fit]
+        src_fit = [t[torch.randperm(t.shape[0])[:m]] for t in src_fit]
     fit_buf = torch.cat(src_fit, 0).to(primary)
     del src_fit
     state = fit_pca_state(fit_buf, remove_bg=bool(opts.get("remove_bg", False)),
-                          l2norm=bool(opts.get("l2norm", False))).to(primary)
+                          l2norm=bool(opts.get("l2norm", False)))
     del fit_buf
-    if primary.startswith("cuda"):
-        torch.cuda.empty_cache()
 
-    # ---- Phase 2: project + render + encode each source with the shared basis ----
-    rendered_total = 0
-    for item in per_src:
-        it, meta = item["it"], item["meta"]
-        gw, gh = item["grid"]; pw, ph = item["proc"]; n = item["n"]
-        feat_paths = item["feat_paths"]
-        ow, oh = _even(meta["width"]), _even(meta["height"])
+    # ---- phase 2: render sources in parallel across devices ----
+    emit(stage="encoding", progress=0.62, message="Rendering PCA video…")
 
-        def gen(feat_paths=feat_paths, ow=ow, oh=oh):
-            nonlocal rendered_total
-            for p in feat_paths:
-                cf = torch.load(p, map_location=primary, weights_only=True)
-                p.unlink()
-                rgb = project_chunk(cf, state).permute(0, 3, 1, 2)  # (k,3,gh,gw)
-                k = rgb.shape[0]
-                for j in range(0, k, 24):
-                    up = F.interpolate(rgb[j:j + 24], size=(oh, ow),
-                                       mode="bilinear", align_corners=False)
-                    up = (up.clamp(0, 1) * 255).round().to(torch.uint8)
-                    up = up.permute(0, 2, 3, 1).contiguous().cpu().numpy()
-                    for f in range(up.shape[0]):
-                        yield up[f]
-                rendered_total += k
-                emit(stage="encoding", progress=0.65 + 0.33 * rendered_total / total_n,
-                     message=f"Encoding PCA video… {int(100 * rendered_total / total_n)}%")
-                del cf, rgb
-
-        # encoders/containers mishandle sub-1 fps; clamp and let the player sync
-        # proportionally by time-fraction (durations need not match).
-        enc_fps = max(1.0, meta["fps_out"])
-        encode_rgb_frames(gen(), it["out"], ow, oh, enc_fps)
+    def emit_done(src):
+        meta, it = src["meta"], src["it"]
+        gh, gw = src["grid"]
+        ph, pw = src["proc"]
         emit(run_id=it["run_id"], run_status="done",
-             result={"width": ow, "height": oh, "frames": n,
-                     "src_fps": round(meta["src_fps"], 2), "out_fps": round(enc_fps, 2),
+             result={"width": _even(meta["width"]), "height": _even(meta["height"]),
+                     "frames": len(src["indices"]),
+                     "src_fps": round(meta["src_fps"], 2), "out_fps": round(max(1.0, src["fps_out"]), 2),
                      "grid": f"{gw}×{gh}", "proc": f"{pw}×{ph}", "gpus": ndev})
+
+    def render_worker(src, dev):
+        try:
+            _render_source(src, state, dev, g, emit_done)
+        except _Cancel:
+            pass
+        except BaseException as e:  # noqa: BLE001
+            g.fail(e)
+
+    rthreads = []
+    for i, s in enumerate(sources):
+        t = threading.Thread(target=render_worker, args=(s, devices[i % ndev]), daemon=True)
+        rthreads.append(t)
+        t.start()
+    for t in rthreads:
+        t.join()
+    if g.error:
+        raise g.error
 
     emit(stage="done", progress=1.0, message="Done")

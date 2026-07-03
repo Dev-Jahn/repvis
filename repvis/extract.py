@@ -1,23 +1,23 @@
 """Dense feature extraction (DINOv2/v3 per-frame, V-JEPA 2.1 spatio-temporal).
 
-Frames are resized (aspect-preserving) to a per-video patch-multiple resolution,
-so the dense grid stays close to the source resolution instead of a tiny square.
-All heavy work runs in bf16 on GPU; long clips are sharded across every GPU.
+Frames arrive as uint8 RGB tensors ALREADY on the extractor's GPU (NVDEC puts
+them there) — there is no host round-trip anywhere in this module. Each call
+runs on a single device; multi-GPU parallelism lives one level up in the
+pipeline, which assigns whole video segments to devices.
+
+All heavy work runs in bf16; preprocessing (resize + normalize) is fused on
+the GPU per batch.
 """
 from __future__ import annotations
 
 import gc
-import inspect
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel
 
 from .config import COMPILE, DEVICES, ModelSpec
-
-_DINO_UNIT = 96  # frames per GPU shard threshold for image models
 
 
 class _Extractor:
@@ -26,15 +26,13 @@ class _Extractor:
         self.device = device
 
         if spec.family == "dino":
-            # DINO is numerically clean in pure bf16.
+            # DINO is numerically clean in pure bf16. transformers >= 5 interpolates
+            # position embeddings automatically for non-native resolutions.
             self.model = AutoModel.from_pretrained(
                 spec.resolve_source(), dtype=torch.bfloat16, attn_implementation="sdpa",
             ).to(device).eval()
             cfg = self.model.config
             self.prefix = 1 + int(getattr(cfg, "num_register_tokens", 0) or 0)
-            # DINOv2 uses learned position embeddings -> must interpolate for any
-            # resolution other than its native one. (DINOv3 uses RoPE; no-op.)
-            self._interp = "interpolate_pos_encoding" in inspect.signature(self.model.forward).parameters
             self.autocast = False
             self.in_dtype = torch.bfloat16
         else:
@@ -48,12 +46,12 @@ class _Extractor:
             except Exception:  # noqa: BLE001 - some builds reject the kwarg
                 self.model = VJEPA21Model.from_pretrained(spec.resolve_source()).to(device).eval()
             self.prefix = 0
-            self._interp = False
             self.autocast = True
             self.in_dtype = torch.float32
 
-        self.mean = torch.tensor(spec.mean, device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor(spec.std, device=device).view(1, 3, 1, 1)
+        # fp16 resize is ~30% faster than fp32 with negligible output diff (<=1e-3)
+        self.mean = torch.tensor(spec.mean, device=device, dtype=torch.float16).view(1, 3, 1, 1)
+        self.std = torch.tensor(spec.std, device=device, dtype=torch.float16).view(1, 3, 1, 1)
 
         if COMPILE:
             try:
@@ -62,74 +60,93 @@ class _Extractor:
                 pass
 
     def _pre(self, frames_u8: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
-        """(n,C,H,W) uint8 -> (n,3,*hw) normalized tensor in self.in_dtype."""
-        x = frames_u8.to(self.device, non_blocking=True).float().div_(255.0)
+        """(n,C,H,W) uint8 on-device -> (n,3,*hw) normalized in self.in_dtype."""
+        x = frames_u8.half().div_(255.0)
         x = F.interpolate(x, size=hw, mode="bicubic", align_corners=False, antialias=True)
         x = (x - self.mean) / self.std
         return x.to(self.in_dtype)
 
     @torch.inference_mode()
-    def process(self, frames_u8, hw, grid, batch_size, tick) -> torch.Tensor:
+    def process(self, frames_u8, hw, grid, batch_size) -> torch.Tensor:
         if self.spec.family == "dino":
-            return self._dino(frames_u8, hw, grid, batch_size, tick)
-        if self.device.startswith("cuda"):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                return self._vjepa(frames_u8, hw, grid, tick)
-        return self._vjepa(frames_u8, hw, grid, tick)
+            return self._dino(frames_u8, hw, grid, batch_size)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return self._vjepa(frames_u8, hw, grid, batch_size)
 
-    def _dino(self, frames_u8, hw, grid, bs, tick) -> torch.Tensor:
+    def _dino(self, frames_u8, hw, grid, bs) -> torch.Tensor:
         gh, gw = grid
         n, npatch = frames_u8.shape[0], gh * gw
-        kw = {"interpolate_pos_encoding": True} if self._interp else {}
         outs = []
         for i in range(0, n, bs):
             x = self._pre(frames_u8[i:i + bs], hw)
-            lhs = self.model(pixel_values=x, **kw).last_hidden_state  # (b, prefix+gh*gw, D)
+            lhs = self.model(pixel_values=x).last_hidden_state  # (b, prefix+gh*gw, D)
             patches = lhs[:, self.prefix:self.prefix + npatch, :]
             outs.append(patches.reshape(x.shape[0], gh, gw, -1).to(torch.float16))
-            tick(x.shape[0])
         return torch.cat(outs, 0)
 
-    def _vjepa(self, frames_u8, hw, grid, tick) -> torch.Tensor:
+    def _vjepa(self, frames_u8, hw, grid, clip_bs) -> torch.Tensor:
+        """Batch several 32-frame clips per forward — one clip under-fills the GPU."""
         gh, gw = grid
         n = frames_u8.shape[0]
         tub, cf = self.spec.tubelet, self.spec.chunk_frames
-        outs, i = [], 0
-        while i < n:
-            chunk = frames_u8[i:i + cf]
-            m = chunk.shape[0]
-            pad = (-m) % tub
-            if pad:
-                chunk = torch.cat([chunk, chunk[-1:].repeat(pad, 1, 1, 1)], 0)
-            x = self._pre(chunk, hw)                       # (m+pad, 3, *hw)
-            mm = x.shape[0]
-            vid = x.permute(1, 0, 2, 3).unsqueeze(0).contiguous()  # (1,3,T,H,W)
+        n_clips = -(-n // cf)
+        outs = []
+        for c0 in range(0, n_clips, clip_bs):
+            clips = []
+            for c in range(c0, min(c0 + clip_bs, n_clips)):
+                clip = frames_u8[c * cf:(c + 1) * cf]
+                pad = cf - clip.shape[0]
+                if pad:   # tail clip: repeat last frame to full length
+                    clip = torch.cat([clip, clip[-1:].repeat(pad, 1, 1, 1)], 0)
+                clips.append(clip)
+            x = self._pre(torch.cat(clips, 0), hw)                    # (B*cf,3,*hw)
+            vid = x.reshape(len(clips), cf, 3, *hw).permute(0, 2, 1, 3, 4).contiguous()
             feats = self.model(pixel_values_videos=vid, skip_predictor=True).last_hidden_state
-            t_tok = mm // tub
-            gridf = feats.reshape(t_tok, gh, gw, -1)       # row-major [T,H,W]
-            gridf = gridf.repeat_interleave(tub, dim=0)[:m]  # tubelet -> frames
+            t_tok = cf // tub
+            gridf = feats.reshape(len(clips) * t_tok, gh, gw, -1)     # row-major [B*T,H,W]
+            gridf = gridf.repeat_interleave(tub, dim=0)               # tubelet -> frames
             outs.append(gridf.to(torch.float16))
-            tick(m)
-            i += cf
-        return torch.cat(outs, 0)
+        return torch.cat(outs, 0)[:n]
 
 
 class _Manager:
     def __init__(self):
         self._cache: dict[tuple[str, str], _Extractor] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # guards _cache
+        self._load_lock = threading.Lock()   # serializes construction (see get)
 
     def get(self, spec: ModelSpec, device: str) -> _Extractor:
         key = (spec.key, device)
         with self._lock:
             ext = self._cache.get(key)
+        if ext is not None:
+            return ext
+        # `from_pretrained(dtype=...)` is NOT thread-safe: it flips torch's global
+        # default dtype during construction, so two models loading concurrently
+        # race and one comes out fp32 (-> "mat1 and mat2 must have the same dtype"
+        # mid-forward). Serialize all construction; loads are one-time and cached.
+        with self._load_lock:
+            with self._lock:
+                ext = self._cache.get(key)
             if ext is None:
                 ext = _Extractor(spec, device)
-                self._cache[key] = ext
+                with self._lock:
+                    self._cache[key] = ext
             return ext
 
 
 MANAGER = _Manager()
+
+
+def warm_model(spec: ModelSpec, device: str):
+    """Load (or reuse) the model on `device` before the pipeline starts."""
+    MANAGER.get(spec, device)
+
+
+def extract_unit_chunk(spec: ModelSpec, frames_u8: torch.Tensor, device: str,
+                       proc: tuple[int, int], grid: tuple[int, int], bs: int) -> torch.Tensor:
+    """Dense features (T, grid_h, grid_w, D) fp16 for an on-device frame chunk."""
+    return MANAGER.get(spec, device).process(frames_u8, proc, grid, bs)
 
 
 def flush_vram() -> dict:
@@ -154,59 +171,3 @@ def flush_vram() -> dict:
             "reserved_before_mb": round(before / 1048576, 1),
             "reserved_after_mb": round(after / 1048576, 1),
             "freed_mb": round((before - after) / 1048576, 1)}
-
-
-def _split(n: int, k: int, align: int = 1) -> list[tuple[int, int]]:
-    k = max(1, min(k, n))
-    base = n // k
-    bounds, s = [], 0
-    for i in range(k):
-        e = n if i == k - 1 else s + base
-        if align > 1 and i < k - 1:
-            e = max(s + align, (e // align) * align)
-        if e > s:
-            bounds.append((s, e))
-        s = e
-        if s >= n:
-            break
-    if bounds and bounds[-1][1] < n:
-        bounds[-1] = (bounds[-1][0], n)
-    return bounds
-
-
-def extract_features(spec: ModelSpec, frames_u8: torch.Tensor, devices: list[str],
-                     hw: tuple[int, int], grid: tuple[int, int],
-                     batch_size: int, progress) -> torch.Tensor:
-    """Return dense features (T, grid_h, grid_w, D) on devices[0]."""
-    n = frames_u8.shape[0]
-    primary = devices[0]
-    unit = spec.chunk_frames if spec.family == "vjepa" else _DINO_UNIT
-    k = max(1, min(len(devices), -(-n // unit)))  # ceil(n/unit), capped at #gpus
-    slices = _split(n, k, align=spec.tubelet if spec.family == "vjepa" else 1)
-
-    results: list[torch.Tensor | None] = [None] * len(slices)
-    lock = threading.Lock()
-    done = [0]
-
-    def tick(c):
-        with lock:
-            done[0] += c
-            progress(min(1.0, done[0] / max(n, 1)))
-
-    def work(i: int, dev: str, s: int, e: int):
-        if dev.startswith("cuda"):
-            torch.cuda.set_device(dev)
-        ext = MANAGER.get(spec, dev)
-        g = ext.process(frames_u8[s:e].to(dev, non_blocking=True), hw, grid, batch_size, tick)
-        results[i] = g.to(primary)
-
-    if len(slices) == 1:
-        work(0, primary, *slices[0])
-    else:
-        with ThreadPoolExecutor(max_workers=len(slices)) as ex:
-            futs = [ex.submit(work, i, devices[i % len(devices)], s, e)
-                    for i, (s, e) in enumerate(slices)]
-            for f in futs:
-                f.result()
-
-    return torch.cat([r for r in results if r is not None], 0)

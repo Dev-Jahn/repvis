@@ -47,8 +47,10 @@ def available_devices() -> list[str]:
 DEVICES = available_devices()
 
 # Streaming: the pipeline processes the video in chunks of this many frames so
-# peak GPU memory is O(one chunk), independent of total video length.
-STREAM_CHUNK = int(os.environ.get("REPVIS_STREAM_CHUNK", "256"))
+# peak GPU memory is O(one chunk), independent of total video length. 64 gives
+# the finest decode/compute/offload overlap without measurable per-chunk overhead
+# (measured sweet spot; larger chunks coarsen the pipelining and use more VRAM).
+STREAM_CHUNK = int(os.environ.get("REPVIS_STREAM_CHUNK", "64"))
 # Only shard onto GPUs with at least this much free VRAM (shared box: skip busy ones).
 _MIN_FREE_GB = float(os.environ.get("REPVIS_MIN_FREE_GB", "16"))
 
@@ -92,6 +94,7 @@ class ModelSpec:
     max_side: int          # cap on the LONGER processed side; aspect preserved, source never upscaled
     tubelet: int = 1       # temporal patch size (vjepa)
     chunk_frames: int = 32  # frames per forward clip (vjepa)
+    batch_size: int = 64   # frames (dino) / clips (vjepa) per forward — tuned per model
     mean: tuple = IMAGENET_MEAN
     std: tuple = IMAGENET_STD
     note: str = ""
@@ -121,25 +124,29 @@ def proc_hw(h: int, w: int, patch: int, max_side: int) -> tuple[int, int, int, i
     return gh * patch, gw * patch, gh, gw
 
 
+# batch_size: measured on RTX PRO 6000 — DINO saturates from bs=32 (throughput
+# flat to 256), so the value is a VRAM/latency tradeoff; V-JEPA gains nothing
+# from batching clips (B=2 == B=1), so it stays at 1 clip per forward.
 REGISTRY: dict[str, ModelSpec] = {
     "dinov2-base": ModelSpec(
         "dinov2-base", "DINOv2 · ViT-B/14", "dino",
-        "facebook/dinov2-base", patch=14, max_side=1024,
+        "facebook/dinov2-base", patch=14, max_side=1024, batch_size=128,
         note="Image SSL. Classic dense-feature rainbow PCA.",
     ),
     "dinov2-large": ModelSpec(
         "dinov2-large", "DINOv2 · ViT-L/14", "dino",
-        "facebook/dinov2-large", patch=14, max_side=1024,
+        "facebook/dinov2-large", patch=14, max_side=1024, batch_size=64,
         note="Larger DINOv2 backbone, sharper parts.",
     ),
     "dinov3-vitb16": ModelSpec(
         "dinov3-vitb16", "DINOv3 · ViT-B/16", "dino",
-        "facebook/dinov3-vitb16-pretrain-lvd1689m", patch=16, max_side=1024,
+        "facebook/dinov3-vitb16-pretrain-lvd1689m", patch=16, max_side=1024, batch_size=128,
         note="Gated (license accepted). RoPE; CLS + 4 registers stripped.",
     ),
     "vjepa21-vitl": ModelSpec(
         "vjepa21-vitl", "V-JEPA 2.1 · ViT-L/16", "vjepa",
         "Dev-Jahn/vjepa2.1-vitl-fpc64-384", patch=16, max_side=640, tubelet=2, chunk_frames=32,
+        batch_size=1,
         note="Video SSL, dense spatio-temporal features. Heavier at high res.",
     ),
 }

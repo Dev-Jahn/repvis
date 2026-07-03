@@ -75,21 +75,44 @@ cell replaces its previous result. **Clear** deletes all results from the server
 
 ## Performance & memory
 
-The pipeline is **streamed in chunks of `REPVIS_STREAM_CHUNK` frames** (default 256)
-so peak GPU memory is O(one chunk), independent of video length — a 1-hour 1080p
-clip at 6000 frames runs in the same ~6 GB as a 256-frame clip. Per chunk:
-decode→extract→spill features to disk (the run dir); the PCA basis is fit once on
-a capped token subsample (temporally consistent colors); then the spilled chunks
-are streamed back to project+encode, each deleted as it is consumed. Host RAM is
-O(one chunk) too — even for **joint** runs over many long sources, whose shared
-basis must see every source before any projection. The spill is transient fp16
-(~`tokens/frame × dim × 2` bytes per frame) on the `runs/` volume.
+**Everything stays on the GPU end to end** — there is no CPU pixel path. Frames
+are decoded straight onto the GPU with NVDEC (torchcodec CUDA), preprocessed and
+run through the backbone in bf16, PCA-projected, upsampled, and handed to the
+NVENC encoder (torchcodec CUDA) still as GPU tensors. The only host traffic is
+the fp16 feature cache (one D2H per chunk) and the tiny PCA basis.
 
-GPUs are chosen per job by free VRAM (`REPVIS_MIN_FREE_GB`, default 16), emptiest
-first, so busy GPUs on a shared box are skipped (never hardcodes `cuda:0`).
+The work is **fully pipelined** so the GPU never waits on I/O. A run is split into
+*units* (contiguous frame segments) bin-packed across GPUs; within each unit,
+three stages run concurrently on separate CUDA streams — NVDEC decode, model
+forward, and the feature D2H — handed off by CUDA events, never a device-wide
+sync. Multiple NVDEC sessions decode in parallel per GPU (the card has several
+decode engines). The default CUDA stream is reserved for torchcodec, which
+synchronizes against it; model math runs on side streams so decode and compute
+truly overlap. Phase 2 (project → upsample → NVENC) is likewise streamed, with
+each source rendered on its own GPU when several are available.
 
-Always on: bf16 (DINO) / bf16-autocast (V-JEPA), SDPA attention, TF32, multi-GPU
-sharding per chunk, GPU-side PCA (SVD), NVENC encode. `torch.compile` is opt-in.
+On one RTX PRO 6000 (Blackwell), a 600-frame 1080p clip went from **~47 s (~6%
+GPU util, CPU-bound) to ~5.5 s** for DINOv2-B and **~40 s → ~6.3 s** for
+V-JEPA 2.1 — roughly **8×** and **6×**, with feature cosine ≥ 0.995 and PCA-RGB
+PSNR ≥ 39 dB vs the old CPU-decode path (the residual is NVDEC's 1–2 LSB color
+conversion + fp16 resize, both visually indistinguishable). Peak GPU memory is
+O(one chunk), independent of video length. Host RAM holds the fp16 feature cache
+(bounded by `max_frames`); for **joint** runs it holds every source's features
+until the shared basis is fit — keep `max_frames` modest when comparing many long
+clips (the box has ample host RAM; nothing spills to disk).
+
+For a single source, decode+extract scale across GPUs but the render/encode is one
+NVENC stream on one GPU, so multi-GPU mainly speeds phase 1; joint runs render
+every source in parallel across GPUs. GPUs are chosen per job by free VRAM
+(`REPVIS_MIN_FREE_GB`, default 16), emptiest first, so busy GPUs on a shared box
+are skipped (never hardcodes `cuda:0`).
+
+Always on: NVDEC decode, GPU preprocess (fp16 resize), bf16 (DINO) /
+bf16-autocast (V-JEPA), SDPA attention, TF32, multi-GPU + multi-stream overlap,
+GPU-side PCA (SVD), NVENC encode. `REPVIS_COMPILE=1` adds `torch.compile`
+(`max-autotune-no-cudagraphs`); it is **opt-in** because it recompiles per input
+resolution (7–40 s warmup each) to save only ~10% of forward time — a win when
+batch-processing many same-resolution long clips, a net loss for varied one-offs.
 
 ## Tests
 

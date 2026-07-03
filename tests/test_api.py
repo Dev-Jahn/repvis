@@ -109,7 +109,7 @@ def test_full_joint_run_and_persistence(clips):
     for rid in rids:
         d = RUNS_DIR / rid
         assert (d / "pca.mp4").exists() and (d / "meta.json").exists()
-        assert not list(d.glob("feat_*.pt"))      # spill files fully consumed
+        assert list(d.iterdir()) and {p.name for p in d.iterdir()} == {"pca.mp4", "meta.json"}
         assert client.get(f"/api/runs/{rid}/pca").status_code == 200
 
     ws = client.get("/api/workspace").json()

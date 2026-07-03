@@ -76,15 +76,15 @@ class PCAState:
     fg_above: bool = True
 
     def to(self, device) -> "PCAState":
-        self.mean = self.mean.to(device)
-        self.comps = self.comps.to(device)
-        self.lo = self.lo.to(device)
-        self.hi = self.hi.to(device)
-        if self.c1 is not None:
-            self.c1 = self.c1.to(device)
-            self.m1 = self.m1.to(device)
-            self.thr = self.thr.to(device)
-        return self
+        """Non-mutating: returns a copy on `device` (states are shared across
+        concurrent render threads, one per GPU)."""
+        return PCAState(
+            self.l2norm, self.mean.to(device), self.comps.to(device),
+            self.lo.to(device), self.hi.to(device), self.remove_bg,
+            None if self.c1 is None else self.c1.to(device),
+            None if self.m1 is None else self.m1.to(device),
+            None if self.thr is None else self.thr.to(device),
+            self.fg_above)
 
 
 @torch.inference_mode()
