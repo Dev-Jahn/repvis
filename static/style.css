@@ -107,6 +107,12 @@ main { max-width: 1320px; margin: 0 auto; padding: 6px 28px 60px; }
 }
 .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip-size { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+.chip-x {
+  flex: 0 0 auto; width: 16px; height: 16px; line-height: 15px; border-radius: 50%;
+  text-align: center; color: var(--muted); font-size: 13px;
+  transition: background .12s, color .12s;
+}
+.chip-x:hover { background: rgba(255,107,129,.18); color: var(--danger); }
 .chip.uploading { cursor: default; color: var(--muted); }
 .chip.error { border-color: var(--danger); color: var(--danger); }
 .chip.flash { animation: flash .6s ease; }
@@ -194,6 +200,13 @@ select:focus, input:focus { border-color: var(--accent); }
 .invchip.iR.on { background: rgba(255,107,129,.85); color: #0a0b10; border-color: transparent; }
 .invchip.iG.on { background: rgba(81,224,150,.85); color: #0a0b10; border-color: transparent; }
 .invchip.iB.on { background: rgba(124,156,255,.9); color: #0a0b10; border-color: transparent; }
+.ctl .dl {
+  width: 22px; height: 24px; line-height: 22px; text-align: center; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--card-2); color: var(--muted);
+  text-decoration: none; font-size: 12px;
+  transition: color .12s, border-color .12s;
+}
+.ctl .dl:hover { color: var(--accent); border-color: var(--accent); }
 .cellinfo { margin-left: auto; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* spinner */

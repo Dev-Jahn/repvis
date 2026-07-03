@@ -22,10 +22,11 @@ let models = [];
 const sources = new Map();        // sourceId -> {id, name, size, selected}
 const cols = [];                  // ordered model keys (matrix columns)
 const rows = [];                  // ordered sourceIds (matrix rows)
-const origCells = new Map();      // sourceId -> {cell, video}
+const colHeads = new Map();       // model -> header cell
+const origCells = new Map();      // sourceId -> {label, cell, video}
 const pcaCells = new Map();       // `${sid}|${model}` -> {cell, video, filter, runId, perm, invert}
 const runMeta = new Map();        // runId -> {sid, model, pcaUrl}
-let masterWired = false;
+let masterEl = null;              // transport master: first row's Original video
 let currentEv = null;             // active run's EventSource
 let running = false;              // a run group is in flight
 
@@ -60,14 +61,25 @@ function updateModelNote() {
 els.modelSelect.addEventListener("change", updateModelNote);
 const modelLabel = (key) => (models.find((m) => m.key === key) || {}).label || key;
 
-// ------------------------------------------------------------- sources
-async function loadSources() {
+// ------------------------------------------------------------- workspace load
+async function loadWorkspace() {
   try {
-    const data = await (await fetch("/api/sources")).json();
+    const data = await (await fetch("/api/workspace")).json();
     for (const s of data.sources) addSourceChip(s);
-  } catch { /* ignore */ }
+    for (const run of data.runs) restoreRun(run);
+    if (data.runs.length) showMatrix();
+    for (const g of data.active || []) attachGroup(g.group_id, g.model, g.runs);
+  } catch { /* server offline */ }
+}
+function restoreRun(run) {
+  ensureColumn(run.model);
+  ensureRow(run.source_id, run.original_url);
+  runMeta.set(run.run_id, { sid: run.source_id, model: run.model, pcaUrl: run.pca_url });
+  setPcaCellRunning(run.source_id, run.model, run.run_id);
+  fillPcaCell(run.run_id, run.result);
 }
 
+// ------------------------------------------------------------- sources
 function addSourceChip(rec) {
   if (sources.has(rec.id)) return;
   sources.set(rec.id, { ...rec, selected: false });
@@ -76,10 +88,14 @@ function addSourceChip(rec) {
   chip.className = "chip";
   chip.dataset.sid = rec.id;
   chip.innerHTML = `<span class="chk-box"></span><span class="chip-name"></span>` +
-                   `<span class="chip-size"></span>`;
+                   `<span class="chip-size"></span><span class="chip-x" title="Delete source and its results">×</span>`;
   chip.querySelector(".chip-name").textContent = rec.name;
   chip.querySelector(".chip-size").textContent =
     rec.size ? `${(rec.size / 1048576).toFixed(0)}MB` : "";
+  chip.querySelector(".chip-x").addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteSource(rec.id, chip);
+  });
   chip.addEventListener("click", () => toggleSource(rec.id, chip));
   els.chips.appendChild(chip);
 }
@@ -98,6 +114,24 @@ function updateRunButton() {
   els.btnRun.textContent = running ? "Running…"
     : n === 0 ? "Select source(s) to run"
     : n === 1 ? "Run ▸" : `Run · joint PCA over ${n} videos ▸`;
+}
+
+async function deleteSource(sid, chip) {
+  const name = (sources.get(sid) || {}).name || sid;
+  if (!confirm(`Delete "${name}" and all of its results?`)) return;
+  let r;
+  try { r = await fetch(`/api/sources/${sid}`, { method: "DELETE" }); }
+  catch { r = null; }
+  if (!r || !r.ok) {
+    chip.classList.add("error");
+    setTimeout(() => chip.classList.remove("error"), 1200);
+    return;
+  }
+  sources.delete(sid);
+  chip.remove();
+  removeRow(sid);
+  if (!sources.size) els.chipsHint.classList.remove("hidden");
+  updateRunButton();
 }
 
 // ---- upload ----
@@ -167,17 +201,24 @@ async function startRun() {
   } catch (e) { finishRun(); return setProgress(0, "Submit failed: " + e, true); }
   if (!res.group_id) { finishRun(); return setProgress(0, res.detail || "Failed to start", true); }
 
-  // lay out the cells immediately (running state)
+  attachGroup(res.group_id, model, res.runs);
+}
+
+// Lay out the group's cells (running state) and follow its SSE stream. Also
+// used to re-attach to an in-flight group after a page reload.
+function attachGroup(groupId, model, runsList) {
+  running = true; updateRunButton();
+  els.runStatus.classList.remove("hidden");
   ensureColumn(model);
-  for (const run of res.runs) {
+  for (const run of runsList) {
     ensureRow(run.source_id, run.original_url);
     runMeta.set(run.run_id, { sid: run.source_id, model, pcaUrl: run.pca_url });
     setPcaCellRunning(run.source_id, model, run.run_id);
   }
   showMatrix();
 
-  const groupRuns = res.runs.map((r) => r.run_id);
-  const ev = new EventSource(`/api/runs/${res.group_id}/events`);
+  const groupRuns = runsList.map((r) => r.run_id);
+  const ev = new EventSource(`/api/runs/${groupId}/events`);
   currentEv = ev;
   ev.onmessage = (msg) => {
     const d = JSON.parse(msg.data);
@@ -186,6 +227,7 @@ async function startRun() {
       if (r.status === "done") fillPcaCell(rid, r.result);
       else if (r.status === "error") setRunFailed(rid);
     }
+    updateBusyCells(groupRuns, d);
     if (d.status === "error") {
       ev.close(); finishRun();
       groupRuns.forEach(setRunFailed);
@@ -202,6 +244,18 @@ async function startRun() {
     groupRuns.forEach(setRunFailed);
     setProgress(0, "Lost connection to server", true);
   };
+}
+
+function updateBusyCells(groupRuns, d) {
+  const pct = Math.round((d.progress || 0) * 100);
+  for (const rid of groupRuns) {
+    const meta = runMeta.get(rid);
+    if (!meta) continue;
+    const entry = pcaCells.get(`${meta.sid}|${meta.model}`);
+    if (!entry || entry.runId !== rid || entry.video) continue;
+    const lbl = entry.cell.querySelector(".cell-busy .busy-msg");
+    if (lbl) lbl.textContent = `${d.stage || "…"} · ${pct}%`;
+  }
 }
 
 function finishRun() {
@@ -250,7 +304,7 @@ function ensureColumn(model) {
   }
   cols.push(model);
   gridTemplate();
-  headerCell(2 + cols.length, modelLabel(model), "model");
+  colHeads.set(model, headerCell(2 + cols.length, modelLabel(model), "model"));
 }
 
 function ensureRow(sid, originalUrl) {
@@ -266,13 +320,88 @@ function ensureRow(sid, originalUrl) {
   video.playsInline = true; video.muted = true; video.preload = "auto";
   video.src = originalUrl;
   cell.appendChild(video);
-  origCells.set(sid, { cell, video });
-  if (!masterWired) {
+  origCells.set(sid, { label, cell, video });
+  if (!masterEl) {
     wireMaster(video);
   } else {
     const m = master();   // a row added mid-playback must join the running master
     if (m && m !== video && !m.paused) { video.play().catch(() => {}); syncOne(video); }
   }
+}
+
+function unloadVideo(v) {
+  if (!v) return;
+  v.pause(); v.removeAttribute("src"); v.load();
+}
+
+function removeRow(sid) {
+  const i = rows.indexOf(sid);
+  if (i === -1) return;
+  rows.splice(i, 1);
+  const o = origCells.get(sid);
+  origCells.delete(sid);
+  if (o) {
+    if (o.video === masterEl) masterEl = null;
+    unloadVideo(o.video);
+    o.cell.remove(); o.label.remove();
+  }
+  for (const model of cols) {
+    const key = `${sid}|${model}`;
+    const entry = pcaCells.get(key);
+    if (!entry) continue;
+    pcaCells.delete(key);
+    if (entry.runId) runMeta.delete(entry.runId);
+    unloadVideo(entry.video);
+    if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();
+    entry.cell.remove();
+  }
+  if (!rows.length) { resetMatrix(); return; }
+  pruneColumns();
+  relayout();
+  if (!masterEl) {   // the removed row owned the transport — hand it to the new first row
+    const v = (origCells.get(rows[0]) || {}).video;
+    if (v) wireMaster(v);
+  }
+}
+
+function pruneColumns() {
+  for (let ci = cols.length - 1; ci >= 0; ci--) {
+    const model = cols[ci];
+    if (rows.some((sid) => pcaCells.has(`${sid}|${model}`))) continue;
+    cols.splice(ci, 1);
+    const head = colHeads.get(model);
+    if (head) head.remove();
+    colHeads.delete(model);
+  }
+}
+
+function relayout() {
+  gridTemplate();
+  cols.forEach((model, ci) => {
+    const head = colHeads.get(model);
+    if (head) head.style.gridColumn = String(3 + ci);
+  });
+  rows.forEach((sid, ri) => {
+    const r = String(2 + ri);
+    const o = origCells.get(sid);
+    if (o) { o.label.style.gridRow = r; o.cell.style.gridRow = r; }
+    cols.forEach((model, ci) => {
+      const e = pcaCells.get(`${sid}|${model}`);
+      if (e) { e.cell.style.gridRow = r; e.cell.style.gridColumn = String(3 + ci); }
+    });
+  });
+}
+
+function resetMatrix() {
+  for (const v of allVideos()) unloadVideo(v);
+  els.matrix.innerHTML = "";
+  els.filterDefs.innerHTML = "";
+  cols.length = 0; rows.length = 0;
+  colHeads.clear(); origCells.clear(); pcaCells.clear(); runMeta.clear();
+  masterEl = null;
+  els.matrix.classList.add("hidden");
+  els.transport.classList.add("hidden");
+  els.matrixEmpty.classList.remove("hidden");
 }
 
 function cellPos(sid, model) {
@@ -288,7 +417,7 @@ function setPcaCellRunning(sid, model, runId) {
     entry = { cell, video: null, filter: null, runId, perm: [0, 1, 2], invert: [false, false, false] };
     pcaCells.set(key, entry);
   } else {
-    if (entry.video) { entry.video.pause(); entry.video.removeAttribute("src"); entry.video.load(); }
+    unloadVideo(entry.video);
     if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();  // drop old swizzle filter
     entry.filter = null;
     entry.runId = runId;
@@ -296,7 +425,7 @@ function setPcaCellRunning(sid, model, runId) {
     entry.video = null;
   }
   entry.cell.classList.add("running");
-  entry.cell.innerHTML = `<div class="cell-busy"><span class="spin big"></span><span>processing…</span></div>`;
+  entry.cell.innerHTML = `<div class="cell-busy"><span class="spin big"></span><span class="busy-msg">queued…</span></div>`;
 }
 
 function fillPcaCell(runId, result) {
@@ -400,6 +529,18 @@ function buildCtl(entry, filter, result) {
   });
   bar.appendChild(inv);
 
+  const meta = runMeta.get(entry.runId);
+  if (meta) {
+    const a = document.createElement("a");
+    a.className = "dl";
+    a.href = meta.pcaUrl;
+    const src = ((sources.get(meta.sid) || {}).name || meta.sid).replace(/\.[^.]+$/, "");
+    a.download = `${src}_${meta.model}_pca.mp4`;
+    a.title = "Download PCA video (encoded as PC1→R PC2→G PC3→B — the swizzle above is display-only)";
+    a.textContent = "⬇";
+    bar.appendChild(a);
+  }
+
   if (result) {
     const info = document.createElement("span");
     info.className = "cellinfo";
@@ -417,10 +558,7 @@ function allVideos() {
   for (const { video } of pcaCells.values()) if (video) vs.push(video);
   return vs;
 }
-function master() {
-  const sid = rows[0];
-  return sid ? (origCells.get(sid) || {}).video : null;
-}
+function master() { return masterEl; }
 function followers() {
   const m = master();
   return allVideos().filter((v) => v !== m);
@@ -445,10 +583,14 @@ function syncOne(f) {
 }
 function syncAll() { for (const f of followers()) syncOne(f); }
 
+// Handlers guard on `masterEl === m` so listeners on a replaced master no-op.
 function wireMaster(m) {
-  masterWired = true;
-  m.addEventListener("loadedmetadata", () => { els.timeDur.textContent = fmt(m.duration); }, { once: true });
+  masterEl = m;
+  const setDur = () => { els.timeDur.textContent = fmt(m.duration); };
+  if (isFinite(m.duration) && m.duration > 0) setDur();
+  else m.addEventListener("loadedmetadata", setDur, { once: true });
   m.addEventListener("timeupdate", () => {
+    if (masterEl !== m) return;
     if (!m.seeking) {
       els.seek.value = String(Math.round((m.currentTime / (m.duration || 1)) * 1000));
       els.timeCur.textContent = fmt(m.currentTime);
@@ -456,11 +598,16 @@ function wireMaster(m) {
     syncAll();
   });
   m.addEventListener("play", () => {
+    if (masterEl !== m) return;
     els.btnPlay.textContent = "❚❚";
     for (const f of followers()) { f.playbackRate = parseFloat(els.speed.value) * ratio(f); f.play().catch(() => {}); }
   });
-  m.addEventListener("pause", () => { els.btnPlay.textContent = "▶"; for (const f of followers()) f.pause(); });
+  m.addEventListener("pause", () => {
+    if (masterEl !== m) return;
+    els.btnPlay.textContent = "▶"; for (const f of followers()) f.pause();
+  });
   m.addEventListener("ended", () => {
+    if (masterEl !== m) return;
     if (els.btnLoop.classList.contains("active")) {
       m.currentTime = 0; for (const f of followers()) f.currentTime = 0;
       m.play(); for (const f of followers()) f.play().catch(() => {});
@@ -490,21 +637,13 @@ els.speed.addEventListener("change", () => {
 els.btnLoop.addEventListener("click", () => els.btnLoop.classList.toggle("active"));
 
 els.btnClear.addEventListener("click", () => {
+  if (!confirm("Clear all results? Sources are kept; PCA videos are deleted from the server.")) return;
   if (currentEv) { currentEv.close(); currentEv = null; }   // stop a stale SSE stream
   finishRun();
-  const m = master();
-  if (m) m.pause();
-  for (const v of allVideos()) { v.pause(); v.removeAttribute("src"); v.load(); }
-  els.matrix.innerHTML = "";
-  els.filterDefs.innerHTML = "";
-  cols.length = 0; rows.length = 0;
-  origCells.clear(); pcaCells.clear(); runMeta.clear();
-  masterWired = false;
-  els.matrix.classList.add("hidden");
-  els.transport.classList.add("hidden");
-  els.matrixEmpty.classList.remove("hidden");
+  resetMatrix();
   els.runStatus.classList.add("hidden");
   setProgress(0, "", false);
+  fetch("/api/runs", { method: "DELETE" }).catch(() => {});
   fetch("/api/flush", { method: "POST" }).catch(() => {});
 });
 
@@ -515,6 +654,8 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-loadModels();
-loadSources();
-updateRunButton();
+(async () => {
+  await loadModels();      // model labels must exist before the matrix is rebuilt
+  await loadWorkspace();
+  updateRunButton();
+})();

@@ -3,20 +3,21 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCES_DIR = ROOT / "sources"   # content-addressed uploaded videos (stored once)
-RUNS_DIR = ROOT / "runs"         # per-run PCA outputs
+DATA_ROOT = Path(os.environ.get("REPVIS_DATA_DIR", str(ROOT)))  # where sources/ + runs/ live
+SOURCES_DIR = DATA_ROOT / "sources"   # content-addressed uploaded videos (stored once)
+RUNS_DIR = DATA_ROOT / "runs"         # per-run PCA outputs + meta (persist across restarts)
 STATIC_DIR = ROOT / "static"
 MODELS_HF_DIR = ROOT / "models_hf"
 VENDOR_SRC = ROOT / "src"  # holds the vendored vjepa21_hf package
 
-SOURCES_DIR.mkdir(exist_ok=True)
-RUNS_DIR.mkdir(exist_ok=True)
+SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 if str(VENDOR_SRC) not in sys.path:
     sys.path.insert(0, str(VENDOR_SRC))
 

@@ -6,10 +6,12 @@ per-source contribution), so the same color means the same feature direction
 *across* videos — that's the cross-video semantic comparison. A single source is
 just a group of one (identical to per-video PCA).
 
-Phase 1: for each source, decode -> extract features per chunk -> offload to CPU,
-         gathering a capped token subsample into one shared fit buffer.
+Phase 1: for each source, decode -> extract features per chunk -> spill each
+         chunk to disk (the run dir), gathering a capped token subsample into
+         one shared fit buffer. Host RAM stays O(one chunk) even for joint runs.
 Phase 2: fit the shared PCA once (temporally + cross-video consistent colors),
-         then project + render + encode each source's own video, freeing as we go.
+         then stream the spilled chunks back to project + render + encode each
+         source's own video, deleting each spill file as it is consumed.
 """
 from __future__ import annotations
 
@@ -72,10 +74,10 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
          message=(f"{nsrc} source(s) · {total_n} frames · {spec.label} · {ndev} GPU(s)"
                   + (" · shared (joint) PCA" if multi else "")))
 
-    # ---- Phase 1: extract every source, cache features on CPU, pool fit sample ----
-    # NOTE: for a joint group the per-source feature caches all live in CPU RAM
-    # until phase 2 (the shared basis must see every source before any projection),
-    # so host RAM here is O(total frames across sources), not O(one chunk).
+    # ---- Phase 1: extract every source, spill features to disk, pool fit sample ----
+    # The shared basis must see every source before any projection, so per-source
+    # feature chunks are spilled to the run dir (fp16) instead of held in host RAM.
+    # RAM stays O(one chunk); disk usage is transient and freed as phase 2 consumes.
     per_src: list[dict] = []
     src_fit: list[torch.Tensor] = []      # one pooled (mi, D) fit sample per source
     done_frames = 0
@@ -85,7 +87,8 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
         n = s.n
         n_chunks = math.ceil(n / chunk)
         per_chunk_quota = max(1, math.ceil(per_source_fit / n_chunks))
-        feat_chunks: list[torch.Tensor] = []  # CPU fp16 (k, gh, gw, D)
+        spill_dir: Path = it["out"].parent
+        feat_paths: list[Path] = []           # spilled fp16 (k, gh, gw, D) chunks
         parts: list[torch.Tensor] = []
         for _start, frames in s.iter_chunks(chunk):
             cf = extract_features(spec, frames, devices, (proc_h, proc_w), (gh, gw), bs, lambda _f: None)
@@ -93,7 +96,9 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
             take = min(flat.shape[0], per_chunk_quota)
             sel = torch.randperm(flat.shape[0], device=flat.device)[:take]
             parts.append(flat[sel].float())
-            feat_chunks.append(cf.to("cpu"))
+            p = spill_dir / f"feat_{len(feat_paths):04d}.pt"
+            torch.save(cf.to("cpu"), p)
+            feat_paths.append(p)
             done_frames += int(frames.shape[0])
             emit(stage="extracting", progress=0.05 + 0.55 * done_frames / total_n,
                  message=f"Extracting dense features… {int(100 * done_frames / total_n)}%  ({done_frames}/{total_n})")
@@ -101,7 +106,7 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
         s.close()
         src_fit.append(torch.cat(parts, 0))
         per_src.append({"it": it, "meta": meta, "grid": (gw, gh), "proc": (proc_w, proc_h),
-                        "n": n, "feat_chunks": feat_chunks})
+                        "n": n, "feat_paths": feat_paths})
 
     # ---- Fit ONE PCA basis over the pooled sample (shared colors across sources) ----
     emit(stage="pca", progress=0.62,
@@ -126,13 +131,14 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
     for item in per_src:
         it, meta = item["it"], item["meta"]
         gw, gh = item["grid"]; pw, ph = item["proc"]; n = item["n"]
-        feat_chunks = item["feat_chunks"]
+        feat_paths = item["feat_paths"]
         ow, oh = _even(meta["width"]), _even(meta["height"])
 
-        def gen(feat_chunks=feat_chunks, ow=ow, oh=oh):
+        def gen(feat_paths=feat_paths, ow=ow, oh=oh):
             nonlocal rendered_total
-            while feat_chunks:
-                cf = feat_chunks.pop(0).to(primary)
+            for p in feat_paths:
+                cf = torch.load(p, map_location=primary, weights_only=True)
+                p.unlink()
                 rgb = project_chunk(cf, state).permute(0, 3, 1, 2)  # (k,3,gh,gw)
                 k = rgb.shape[0]
                 for j in range(0, k, 24):

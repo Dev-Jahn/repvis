@@ -2,7 +2,8 @@
 
 Sources are stored once by content hash (re-processing never grows disk). A run
 group processes one or more sources with a shared PCA basis; the matrix UI fills
-a (source × model) grid as each run finishes.
+a (source × model) grid as each run finishes. Completed runs persist on disk
+(meta.json + pca.mp4) so the workspace survives page reloads and restarts.
 """
 from __future__ import annotations
 
@@ -13,12 +14,13 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,17 +44,6 @@ def _safe_id(x: str) -> bool:
     return bool(x and _ID_RE.match(x))
 
 
-def _clear_runs():
-    """Run outputs are session-scoped (GROUPS is in-memory, never reloaded), so
-    wipe stale run dirs on startup to keep disk bounded across restarts."""
-    for d in RUNS_DIR.glob("*"):
-        if d.is_dir():
-            shutil.rmtree(d, ignore_errors=True)
-
-
-_clear_runs()
-
-
 def _scan_sources():
     """Rebuild the in-memory source index from disk (survives restarts)."""
     for d in sorted(SOURCES_DIR.glob("*")):
@@ -73,11 +64,56 @@ def _scan_sources():
                            "size": v.stat().st_size}
 
 
+def _run_record(d: Path) -> dict | None:
+    """meta.json of a *completed* run dir, or None if the dir isn't one."""
+    try:
+        m = json.loads((d / "meta.json").read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    return m if (d / "pca.mp4").exists() else None
+
+
+def _prune_runs():
+    """Startup GC: drop incomplete, orphaned (source gone) and superseded run
+    dirs. Completed runs persist so the workspace survives restarts."""
+    latest: dict[tuple[str, str], tuple[float, Path]] = {}
+    for d in RUNS_DIR.glob("*"):
+        if not d.is_dir():
+            continue
+        m = _run_record(d)
+        if not m or m.get("source_id") not in SOURCES:
+            shutil.rmtree(d, ignore_errors=True)
+            continue
+        key = (m["source_id"], m["model"])
+        prev = latest.get(key)
+        if prev and prev[0] >= m.get("created", 0.0):
+            shutil.rmtree(d, ignore_errors=True)
+        else:
+            if prev:
+                shutil.rmtree(prev[1], ignore_errors=True)
+            latest[key] = (m.get("created", 0.0), d)
+
+
 _scan_sources()
+_prune_runs()
 
 
 # ---------------------------------------------------------------- progress emit
+def _persist_run(meta: dict):
+    """Write a completed run's meta.json and retire the previous result for the
+    same (source, model) cell — a re-run supersedes it."""
+    rid, sid, model = meta["run_id"], meta["source_id"], meta["model"]
+    (RUNS_DIR / rid / "meta.json").write_text(json.dumps(meta))
+    for d in RUNS_DIR.glob("*"):
+        if d.name == rid or not d.is_dir():
+            continue
+        m = _run_record(d)
+        if m and m.get("source_id") == sid and m.get("model") == model:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _emit(group: dict, **kw):
+    persist = None
     with LOCK:
         rid = kw.pop("run_id", None)
         rstatus = kw.pop("run_status", None)
@@ -88,6 +124,10 @@ def _emit(group: dict, **kw):
                 r["result"] = rresult
             if rstatus is not None:
                 r["status"] = rstatus
+            if rstatus == "done":
+                persist = {"run_id": rid, "source_id": r["source_id"],
+                           "model": group["model"], "opts": group["opts"],
+                           "result": r["result"], "created": time.time()}
         group.update(kw)
         if kw.get("error"):
             group["status"] = "error"
@@ -99,6 +139,8 @@ def _emit(group: dict, **kw):
         elif "stage" in kw or "progress" in kw:
             group["status"] = "running"
         group["rev"] += 1
+    if persist:   # disk I/O outside the lock; only the single worker gets here
+        _persist_run(persist)
 
 
 # ------------------------------------------------------------------ static/info
@@ -191,6 +233,62 @@ def source_video(sid: str):
     return FileResponse(p)
 
 
+def _active_run_ids() -> set[str]:
+    """Run ids belonging to groups still queued/running (call under LOCK)."""
+    return {rid for g in GROUPS.values() if g["status"] in ("queued", "running")
+            for rid in g["runs"]}
+
+
+@app.delete("/api/sources/{sid}")
+def delete_source(sid: str):
+    """Remove a source and every result derived from it."""
+    if not _safe_id(sid):
+        raise HTTPException(404)
+    with LOCK:
+        if _active_run_ids():
+            raise HTTPException(409, "a run is in progress")
+        if sid not in SOURCES:
+            raise HTTPException(404)
+        SOURCES.pop(sid)
+    shutil.rmtree(SOURCES_DIR / sid, ignore_errors=True)
+    for d in RUNS_DIR.glob("*"):
+        if d.is_dir():
+            m = _run_record(d)
+            if m and m.get("source_id") == sid:
+                shutil.rmtree(d, ignore_errors=True)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------- workspace
+@app.get("/api/workspace")
+def workspace():
+    """Everything the client needs to rebuild the matrix: sources, completed
+    runs (latest per source×model, oldest first) and still-active groups the
+    client can re-attach to after a reload."""
+    with LOCK:
+        srcs = list(SOURCES.values())
+        have = set(SOURCES)
+        active_ids = _active_run_ids()
+        active = [{"group_id": g["id"], "model": g["model"],
+                   "runs": [{"run_id": rid, "source_id": r["source_id"],
+                             "pca_url": f"/api/runs/{rid}/pca",
+                             "original_url": f"/api/sources/{r['source_id']}/video"}
+                            for rid, r in g["runs"].items()]}
+                  for g in GROUPS.values() if g["status"] in ("queued", "running")]
+    metas = []
+    for d in RUNS_DIR.glob("*"):
+        if d.is_dir() and d.name not in active_ids:
+            m = _run_record(d)
+            if m and m.get("source_id") in have:
+                metas.append(m)
+    metas.sort(key=lambda m: m.get("created", 0.0))
+    runs = [{"run_id": m["run_id"], "source_id": m["source_id"], "model": m["model"],
+             "result": m["result"],
+             "pca_url": f"/api/runs/{m['run_id']}/pca",
+             "original_url": f"/api/sources/{m['source_id']}/video"} for m in metas]
+    return {"sources": srcs, "runs": runs, "active": active}
+
+
 # -------------------------------------------------------------------------- runs
 @app.post("/api/runs")
 def create_runs(payload: dict = Body(...)):
@@ -219,7 +317,7 @@ def create_runs(payload: dict = Body(...)):
     gid = uuid.uuid4().hex[:12]
     runs = {it["run_id"]: {"run_id": it["run_id"], "source_id": it["source_id"],
                            "status": "running", "result": None} for it in items}
-    group = {"id": gid, "model": model, "status": "queued", "stage": "queued",
+    group = {"id": gid, "model": model, "opts": opts, "status": "queued", "stage": "queued",
              "progress": 0.0, "message": "Queued…", "error": None, "rev": 0, "runs": runs}
     with LOCK:
         GROUPS[gid] = group
@@ -231,6 +329,10 @@ def create_runs(payload: dict = Body(...)):
             traceback.print_exc()
             _emit(group, stage="error", error=str(e), message=f"Error: {e}")
         finally:
+            for it in items:   # failed/aborted runs (no meta.json) leave no dirs behind
+                rd = RUNS_DIR / it["run_id"]
+                if not (rd / "meta.json").exists():
+                    shutil.rmtree(rd, ignore_errors=True)
             try:
                 flush_vram()
             except Exception:  # noqa: BLE001
@@ -283,6 +385,19 @@ def run_pca(rid: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p)
+
+
+@app.delete("/api/runs")
+def delete_runs():
+    """Clear all completed results (in-flight groups are left untouched)."""
+    with LOCK:
+        active_ids = _active_run_ids()
+    removed = 0
+    for d in RUNS_DIR.glob("*"):
+        if d.is_dir() and d.name not in active_ids:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return {"ok": True, "removed": removed}
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
