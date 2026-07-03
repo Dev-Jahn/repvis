@@ -144,11 +144,22 @@ REGISTRY: dict[str, ModelSpec] = {
         "facebook/dinov2-large", patch=14, max_side=1024, batch_size=64,
         note="Larger DINOv2 backbone, sharper parts.",
     ),
+    "dinov2-giant": ModelSpec(
+        "dinov2-giant", "DINOv2 · ViT-g/14", "dino",
+        "facebook/dinov2-giant", patch=14, max_side=1024, batch_size=32,
+        note="1.1B-param giant. Best DINOv2 features, ~4× slower than large.",
+    ),
     "dinov3-vitb16": ModelSpec(
         "dinov3-vitb16", "DINOv3 · ViT-B/16", "dino",
         "facebook/dinov3-vitb16-pretrain-lvd1689m", patch=16, max_side=1024, batch_size=128,
         compile=True,   # RoPE fusion: +16% wall (measured)
         note="Gated (license accepted). RoPE; CLS + 4 registers stripped.",
+    ),
+    "dinov3-vith16plus": ModelSpec(
+        "dinov3-vith16plus", "DINOv3 · ViT-H+/16", "dino",
+        "facebook/dinov3-vith16plus-pretrain-lvd1689m", patch=16, max_side=1024, batch_size=64,
+        compile=True,   # RoPE fusion, same as vitb16
+        note="Gated. 840M-param huge+; RoPE; CLS + registers stripped.",
     ),
     "vjepa21-vitl": ModelSpec(
         "vjepa21-vitl", "V-JEPA 2.1 · ViT-L/16", "vjepa",

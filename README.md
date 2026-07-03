@@ -16,7 +16,9 @@ color then means the same feature direction *across* videos.
 |-----|----------|------|-------|
 | `dinov2-base`  | DINOv2 ViT-B/14 | image, per-frame | classic rainbow PCA |
 | `dinov2-large` | DINOv2 ViT-L/14 | image, per-frame | sharper parts |
+| `dinov2-giant` | DINOv2 ViT-g/14 | image, per-frame | 1.1B params; best DINOv2 features, ~4× slower than large |
 | `dinov3-vitb16`| DINOv3 ViT-B/16 | image, per-frame | gated; CLS+4 registers stripped |
+| `dinov3-vith16plus` | DINOv3 ViT-H+/16 | image, per-frame | gated; 840M params |
 | `vjepa21-vitl` | V-JEPA 2.1 ViT-L/16 @384 | video, spatio-temporal | tubelet=2, 24×24 grid |
 
 All weights download from the HF Hub on first use. V-JEPA 2.1 pulls
