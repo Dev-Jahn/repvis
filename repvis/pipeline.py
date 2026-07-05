@@ -33,8 +33,8 @@ import torch
 import torch.nn.functional as F
 
 from .config import REGISTRY, STREAM_CHUNK, proc_hw, select_devices
-from .extract import extract_unit_chunk, warm_model
-from .pca import fit_pca_state, project_chunk
+from .extract import extract_unit_chunk, gray_field, warm_model
+from .pca import BgCtx, fit_pca_state, project_chunk
 from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
 
 _FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
@@ -234,7 +234,7 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
     """Drain a unit's decode queue through the model; hand features to the
     device's offload worker."""
     dq = unit["_dq"]
-    fit_parts: list[torch.Tensor] = []
+    fit_parts: list[tuple[torch.Tensor, torch.Tensor]] = []   # (tokens, grid positions)
     n_chunks = math.ceil((unit["hi"] - unit["lo"]) / chunk)
     quota = max(1, math.ceil(unit["fit_quota"] / max(n_chunks, 1)))
     s_cmp = torch.cuda.Stream(device=dev)
@@ -251,7 +251,9 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
                 flat = feats.reshape(-1, feats.shape[-1])
                 take = min(flat.shape[0], quota)
                 sel = torch.randperm(flat.shape[0], device=flat.device)[:take]
-                fit_parts.append(flat[sel].float())
+                npatch = unit["grid"][0] * unit["grid"][1]
+                # keep each token's grid position: remove_bg debiases by position
+                fit_parts.append((flat[sel].float(), (sel % npatch).to(torch.int32)))
                 fev = torch.cuda.Event()
                 fev.record(s_cmp)
                 if not _cput(oq, (unit, feats, fev), g):   # offload dead/cancelled
@@ -262,7 +264,8 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
         _stop_decode(unit)      # always stop+join this unit's decoder
     g.check()
     with torch.cuda.stream(s_cmp):
-        unit["fit"] = torch.cat(fit_parts, 0).to("cpu") if fit_parts else None
+        unit["fit"] = (torch.cat([t for t, _ in fit_parts], 0).to("cpu"),
+                       torch.cat([p for _, p in fit_parts], 0).to("cpu")) if fit_parts else None
     s_cmp.synchronize()
 
 
@@ -450,20 +453,36 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
     emit(stage="pca", progress=0.58,
          message="Fitting shared PCA basis…" if multi else "Fitting PCA basis…")
     primary = devices[0]
-    src_fit = []
+    src_fit = []   # (tokens, positions) per source
     for s in sources:
         parts = [u["fit"] for u in s["units"] if u["fit"] is not None]
         for u in s["units"]:
             u["fit"] = None
-        src_fit.append(torch.cat(parts, 0))
+        src_fit.append((torch.cat([t for t, _ in parts], 0),
+                        torch.cat([p for _, p in parts], 0)))
     if len(src_fit) > 1:   # a long source must not out-weight a short one
-        m = min(int(t.shape[0]) for t in src_fit)
-        src_fit = [t[torch.randperm(t.shape[0])[:m]] for t in src_fit]
-    fit_buf = torch.cat(src_fit, 0).to(primary)
+        m = min(int(t.shape[0]) for t, _ in src_fit)
+        sel = [torch.randperm(t.shape[0])[:m] for t, _ in src_fit]
+        src_fit = [(t[i], p[i]) for (t, p), i in zip(src_fit, sel)]
+    fit_buf = torch.cat([t for t, _ in src_fit], 0).to(primary)
+    remove_bg = bool(opts.get("remove_bg", False))
+    bg = None
+    if remove_bg:
+        # gray positional fields (one model forward per distinct grid, cached)
+        fields = {}
+        for s in sources:
+            gr = tuple(s["grid"])
+            if gr not in fields:
+                fields[gr] = gray_field(spec, primary, tuple(s["proc"]), gr)
+        bg = BgCtx(
+            pos=torch.cat([p for _, p in src_fit], 0).long().to(primary),
+            grid_id=torch.cat([torch.full((t.shape[0],), si, dtype=torch.long)
+                               for si, (t, _) in enumerate(src_fit)], 0).to(primary),
+            grids=[tuple(s["grid"]) for s in sources], fields=fields)
     del src_fit
-    state = fit_pca_state(fit_buf, remove_bg=bool(opts.get("remove_bg", False)),
-                          l2norm=bool(opts.get("l2norm", False)))
-    del fit_buf
+    state = fit_pca_state(fit_buf, remove_bg=remove_bg,
+                          l2norm=bool(opts.get("l2norm", False)), bg=bg)
+    del fit_buf, bg
 
     # ---- phase 2: render sources in parallel across devices ----
     emit(stage="encoding", progress=0.62, message="Rendering PCA video…")

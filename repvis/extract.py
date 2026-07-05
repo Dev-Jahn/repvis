@@ -144,6 +144,35 @@ class _Manager:
 
 MANAGER = _Manager()
 
+_GRAY_LEVELS = (64, 128, 192)
+_gray_cache: dict[tuple, torch.Tensor] = {}
+_gray_lock = threading.Lock()
+
+
+@torch.inference_mode()
+def gray_field(spec: ModelSpec, device: str, proc: tuple[int, int],
+               grid: tuple[int, int]) -> torch.Tensor:
+    """The model's positional field: its mean response to uniform gray frames.
+
+    Gray frames carry no content, so this isolates the position-dependent
+    component of the features (RoPE/pos-emb leakage). Used by remove_bg to
+    debias tokens before fg/bg clustering. Cached per (model, grid); (gh*gw, D)
+    float32 on `device`.
+    """
+    key = (spec.key, tuple(grid))
+    with _gray_lock:
+        f = _gray_cache.get(key)
+    if f is None:
+        n = spec.chunk_frames if spec.family == "vjepa" else 1
+        frames = torch.cat([torch.full((n, 3, *proc), v, dtype=torch.uint8, device=device)
+                            for v in _GRAY_LEVELS])
+        feats = MANAGER.get(spec, device).process(frames, tuple(proc), tuple(grid),
+                                                  spec.batch_size)
+        f = feats.float().mean(0).reshape(-1, feats.shape[-1]).cpu()
+        with _gray_lock:
+            _gray_cache[key] = f
+    return f.to(device)
+
 
 def warm_model(spec: ModelSpec, device: str):
     """Load (or reuse) the model on `device` before the pipeline starts."""
