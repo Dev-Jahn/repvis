@@ -1,0 +1,18 @@
+version: 1
+project: repvis
+
+# ssot: omitted — repvis has no single canonical design doc; SSOT features are disabled.
+#       The design record is PROGRESS.md + README.md + code docstrings + commit messages.
+
+progress: PROGRESS.md
+adr_dir: docs/adr
+reviews_dir: docs/reviews
+progress_archive_dir: docs/progress
+
+review:
+  mode: packet                  # packet: close round, push, hand a web reviewer the round request markdown
+  reviewers: [codex, gpt-5.5-pro]
+  require_ci: false
+
+state:
+  last_round_commit: null
