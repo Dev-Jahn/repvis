@@ -6,7 +6,7 @@ const els = {
   dropzone: $("dropzone"), fileInput: $("file-input"),
   chips: $("source-chips"), chipsHint: $("chips-hint"),
   modelSelect: $("model-select"), modelNote: $("model-note"), gpuBadge: $("gpu-badge"),
-  removebg: $("opt-removebg"), l2: $("opt-l2"),
+  l2: $("opt-l2"),
   maxside: $("opt-maxside"), maxframes: $("opt-maxframes"), fps: $("opt-fps"),
   btnRun: $("btn-run"),
   runStatus: $("run-status"), progFill: $("prog-fill"), progMsg: $("prog-msg"),
@@ -74,7 +74,7 @@ async function loadWorkspace() {
 function restoreRun(run) {
   ensureColumn(run.model);
   ensureRow(run.source_id, run.original_url);
-  runMeta.set(run.run_id, { sid: run.source_id, model: run.model, pcaUrl: run.pca_url, bg: run.bg || null });
+  runMeta.set(run.run_id, { sid: run.source_id, model: run.model, pcaUrl: run.pca_url, seg: run.seg || null });
   setPcaCellRunning(run.source_id, run.model, run.run_id);
   fillPcaCell(run.run_id, run.result);
 }
@@ -182,7 +182,7 @@ async function startRun() {
   if (!sel.length || running) return;
   const model = els.modelSelect.value;
   const opts = {
-    remove_bg: els.removebg.checked, l2norm: els.l2.checked,
+    l2norm: els.l2.checked,
     max_frames: Math.max(8, parseInt(els.maxframes.value, 10) || 600),
     fps: Math.max(1, parseFloat(els.fps.value) || 24),
     max_side: parseInt(els.maxside.value || "0", 10),
@@ -212,7 +212,7 @@ function attachGroup(groupId, model, runsList) {
   ensureColumn(model);
   for (const run of runsList) {
     ensureRow(run.source_id, run.original_url);
-    runMeta.set(run.run_id, { sid: run.source_id, model, pcaUrl: run.pca_url, bg: run.bg || null });
+    runMeta.set(run.run_id, { sid: run.source_id, model, pcaUrl: run.pca_url, seg: run.seg || null });
     setPcaCellRunning(run.source_id, model, run.run_id);
   }
   showMatrix();
@@ -225,8 +225,8 @@ function attachGroup(groupId, model, runsList) {
     setProgress(d.progress, d.message, d.status === "error");
     for (const [rid, r] of Object.entries(d.runs || {})) {
       if (r.status === "done") {
-        const mm = runMeta.get(rid);       // pick up bg if the SSE done event carries it
-        if (mm && r.bg) mm.bg = r.bg;
+        const mm = runMeta.get(rid);       // pick up seg if the SSE done event carries it
+        if (mm && r.seg) mm.seg = r.seg;
         fillPcaCell(rid, r.result);
       } else if (r.status === "error") setRunFailed(rid);
     }
@@ -354,7 +354,7 @@ function removeRow(sid) {
     if (!entry) continue;
     pcaCells.delete(key);
     if (entry.runId) runMeta.delete(entry.runId);
-    stopMask(entry);
+    stopSeg(entry);
     unloadVideo(entry.video);
     if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();
     entry.cell.remove();
@@ -397,7 +397,7 @@ function relayout() {
 }
 
 function resetMatrix() {
-  for (const e of pcaCells.values()) stopMask(e);
+  for (const e of pcaCells.values()) stopSeg(e);
   for (const v of allVideos()) unloadVideo(v);
   els.matrix.innerHTML = "";
   els.filterDefs.innerHTML = "";
@@ -422,7 +422,7 @@ function setPcaCellRunning(sid, model, runId) {
     entry = { cell, video: null, filter: null, runId, perm: [0, 1, 2], invert: [false, false, false] };
     pcaCells.set(key, entry);
   } else {
-    stopMask(entry);
+    stopSeg(entry);
     unloadVideo(entry.video);
     if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();  // drop old swizzle filter
     entry.filter = null;
@@ -456,13 +456,14 @@ function fillPcaCell(runId, result) {
   entry.video = video;
   entry.filter = filter;
 
-  // live background-threshold mask overlay (bg source: fresh run -> result.bg,
-  // reload/re-attach -> the run entry's bg captured in runMeta)
-  const bg = (result && result.bg) || meta.bg || null;
-  entry.bg = bg;
-  if (bg && bg.available) {
-    startMask(entry);                          // inserts the mask <canvas> over the video
-    entry.cell.appendChild(buildBgCtl(entry)); // slider + 강조 refit button
+  // SAM foreground segmentation: click layer + point markers over the (baked) video.
+  // seg source: fresh run -> result.seg, reload/re-attach -> run entry's seg in runMeta.
+  const seg = (result && result.seg) || meta.seg || null;
+  entry.seg = seg;
+  if (seg && seg.available) {
+    entry.points = (seg.points || []).map((p) => p.slice());
+    startSeg(entry);                            // click layer + markers over the video
+    entry.cell.appendChild(buildSegCtl(entry)); // ↺ reset + Refit
   }
 
   // join playback already in progress
@@ -566,207 +567,178 @@ function buildCtl(entry, filter, result) {
   return bar;
 }
 
-// -------------------------------------------------- live background-threshold mask
-// Mirrors pca.apply_mask exactly: keep a patch iff score/255 < threshold, then two
-// passes of a 3x3 majority filter (avg_pool2d k=3 s=1 pad=1, count_include_pad -> /9,
-// > 0.5). Background patches are painted opaque black over the (swizzled) video; the
-// server's pca.mp4 stays unmasked, so masking is live and reversible client-side.
+// -------------------------------------------------- SAM foreground segmentation
+// The mask is pixel-accurate (SAM2), temporally propagated, and BAKED into pca.mp4
+// server-side — no client overlay. Here we let the user refine it by clicking the
+// video: left click adds a positive (+) point, Alt/Option+click a negative (−) one.
+// Clicks map clientX/Y -> SOURCE pixel coords through the video content rect
+// (object-fit: contain). Each edit POSTs the whole point set, then reloads the
+// re-baked video. Point markers are drawn over the video and kept positioned.
 
-function majority3(m, h, w) {
-  const out = new Float32Array(h * w);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let s = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        const yy = y + dy;
-        if (yy < 0 || yy >= h) continue;   // zero-padding (out of bounds counts as 0)
-        for (let dx = -1; dx <= 1; dx++) {
-          const xx = x + dx;
-          if (xx < 0 || xx >= w) continue;
-          s += m[yy * w + xx];
-        }
-      }
-      out[y * w + x] = s / 9 > 0.5 ? 1 : 0;   // count_include_pad divides by 9
-    }
+// clientX/Y -> source pixel (x,y) via the video's contain-fit content rect.
+// Returns null if the video has no intrinsic size yet or the click is outside it.
+function clickToSource(v, clientX, clientY) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) return null;
+  const rect = v.getBoundingClientRect();
+  const scale = Math.min(rect.width / vw, rect.height / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const dx = rect.left + (rect.width - dw) / 2, dy = rect.top + (rect.height - dh) / 2;
+  const x = (clientX - dx) / scale, y = (clientY - dy) / scale;
+  if (x < 0 || y < 0 || x > vw || y > vh) return null;   // gutter / letterbox
+  return [x, y];
+}
+
+// (Re)draw the point markers at their source coords mapped into the display box.
+function drawMarkers(entry) {
+  const cont = entry.markers, v = entry.video;
+  if (!cont || !v) return;
+  cont.innerHTML = "";
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const bw = v.clientWidth, bh = v.clientHeight;
+  if (!vw || !vh || !bw || !bh) return;
+  const scale = Math.min(bw / vw, bh / vh);
+  const dw = vw * scale, dh = vh * scale, offx = (bw - dw) / 2, offy = (bh - dh) / 2;
+  for (const [x, y, label] of entry.points) {
+    const dot = document.createElement("div");
+    dot.className = "segdot " + (label ? "pos" : "neg");
+    dot.style.left = (offx + x * scale) + "px";
+    dot.style.top = (offy + y * scale) + "px";
+    cont.appendChild(dot);
   }
-  return out;
 }
 
-// Keep the canvas backing store matched to the displayed video box, then repaint.
-function sizeCanvas(entry) {
-  const v = entry.video, cv = entry.canvas;
-  if (!v || !cv) return;
-  const w = v.clientWidth, h = v.clientHeight;
-  if (!w || !h) return;
-  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-  cv.style.height = h + "px";
-  paintMask(entry);
+function onSegClick(entry, e) {
+  if (entry.segBusy) return;
+  const pt = clickToSource(entry.video, e.clientX, e.clientY);
+  if (!pt) return;
+  e.preventDefault();
+  entry.points.push([pt[0], pt[1], e.altKey ? 0 : 1]);   // Alt/Option -> negative
+  drawMarkers(entry);
+  submitSeg(entry);
 }
 
-// Paint the mask for entry.frameIdx at the current threshold onto entry.canvas.
-function paintMask(entry) {
-  const bg = entry.bg, cv = entry.canvas, scores = entry.scores;
-  if (!cv || !scores || !bg) return;
-  const gh = bg.grid[0], gw = bg.grid[1], np = gh * gw;
-  const base = (entry.frameIdx | 0) * np;
-  const t = bg.threshold;
-  let m = new Float32Array(np);
-  for (let i = 0; i < np; i++) m[i] = scores[base + i] / 255 < t ? 1 : 0;   // 1 = foreground
-  m = majority3(m, gh, gw);
-  m = majority3(m, gh, gw);
+function startSeg(entry) {
+  const v = entry.video;
+  const layer = document.createElement("div");
+  layer.className = "seglayer";
+  layer.title = "Click to add a foreground point (+), Alt/Option-click for background (−)";
+  const markers = document.createElement("div");
+  markers.className = "segmarkers";
+  layer.appendChild(markers);
+  entry.seglayer = layer; entry.markers = markers;
+  v.insertAdjacentElement("afterend", layer);          // over the video, below .ctl
 
-  // offscreen gw×gh: background opaque black (a=255), foreground transparent (a=0)
-  const octx = entry.offCtx;
-  const img = octx.createImageData(gw, gh);
-  const data = img.data;
-  for (let i = 0; i < np; i++) data[i * 4 + 3] = m[i] ? 0 : 255;   // rgb already 0
-  octx.putImageData(img, 0, 0);
-
-  // scale into the video's *content* rect (video is object-fit: contain) with
-  // smoothing on, to match the server's bilinear upsample of the mask.
-  const ctx = entry.ctx, cw = cv.width, ch = cv.height, v = entry.video;
-  const vw = v.videoWidth || gw, vh = v.videoHeight || gh;
-  const scale = Math.min(cw / vw, ch / vh);
-  const dw = vw * scale, dh = vh * scale, dx = (cw - dw) / 2, dy = (ch - dh) / 2;
-  ctx.clearRect(0, 0, cw, ch);
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(entry.offCanvas, 0, 0, gw, gh, dx, dy, dw, dh);
+  layer.addEventListener("pointerdown", (e) => onSegClick(entry, e));
+  entry.segRo = new ResizeObserver(() => drawMarkers(entry));
+  entry.segRo.observe(v);
+  entry._segload = () => drawMarkers(entry);
+  v.addEventListener("loadeddata", entry._segload);     // videoWidth known -> place dots
+  drawMarkers(entry);
 }
 
-async function loadBgScores(entry) {
-  try {
-    const r = await fetch(`/api/runs/${entry.runId}/bgscore`);
-    if (!r.ok) return;                       // 404 -> no scores, leave overlay blank
-    const buf = await r.arrayBuffer();
-    if (!entry.canvas) return;               // cell was torn down while fetching
-    entry.scores = new Uint8Array(buf);      // (frames, gh, gw) uint8, C-contiguous
-    sizeCanvas(entry);
-    if (entry._draw) entry._draw(entry.video.currentTime || 0);
-  } catch { /* offline — overlay stays blank */ }
-}
-
-function startMask(entry) {
-  const v = entry.video, bg = entry.bg;
-  const cv = document.createElement("canvas");
-  cv.className = "maskcanvas";
-  entry.canvas = cv;
-  entry.ctx = cv.getContext("2d");
-  const off = document.createElement("canvas");
-  off.width = bg.grid[1]; off.height = bg.grid[0];   // gw × gh
-  entry.offCanvas = off; entry.offCtx = off.getContext("2d");
-  entry.frameIdx = 0;
-  v.insertAdjacentElement("afterend", cv);           // sits above the video, below .ctl
-
-  entry.ro = new ResizeObserver(() => sizeCanvas(entry));
-  entry.ro.observe(v);
-
-  const draw = (mediaTime) => {
-    // Map playback position -> bgscore frame by TIME FRACTION over the real video
-    // duration. NVENC rounds a sub-1fps encode up, so bg.fps can disagree with the
-    // actual encoded rate; the duration ratio stays correct (frames == pca-video frames).
-    const dur = v.duration;
-    const idx = (dur && isFinite(dur) && dur > 0)
-      ? Math.floor((mediaTime / dur) * bg.frames)
-      : Math.round(mediaTime * bg.fps);
-    entry.frameIdx = Math.min(bg.frames - 1, Math.max(0, idx));
-    paintMask(entry);
-  };
-  entry._draw = draw;
-
-  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
-    const cb = (now, md) => {
-      if (!entry.canvas) return;                      // stopped
-      draw(md.mediaTime);
-      entry._rvfc = v.requestVideoFrameCallback(cb);
-    };
-    entry._rvfc = v.requestVideoFrameCallback(cb);
-  } else {                                            // fallback: rAF ticker off currentTime
-    const tick = () => {
-      if (!entry.canvas) return;
-      draw(v.currentTime || 0);
-      entry._raf = requestAnimationFrame(tick);
-    };
-    entry._raf = requestAnimationFrame(tick);
-  }
-  v.addEventListener("loadeddata", () => { sizeCanvas(entry); draw(v.currentTime || 0); });
-
-  loadBgScores(entry);
-}
-
-function stopMask(entry) {
+function stopSeg(entry) {
   if (!entry) return;
-  if (entry._rvfc && entry.video && entry.video.cancelVideoFrameCallback)
-    entry.video.cancelVideoFrameCallback(entry._rvfc);
-  if (entry._raf) cancelAnimationFrame(entry._raf);
-  if (entry.ro) entry.ro.disconnect();
-  if (entry.canvas && entry.canvas.parentNode) entry.canvas.remove();
-  entry._rvfc = null; entry._raf = null; entry.ro = null;
-  entry.canvas = null; entry.ctx = null;
-  entry.offCanvas = null; entry.offCtx = null; entry.scores = null;
+  if (entry.segRo) entry.segRo.disconnect();
+  if (entry._segload && entry.video) entry.video.removeEventListener("loadeddata", entry._segload);
+  if (entry.seglayer && entry.seglayer.parentNode) entry.seglayer.remove();
+  entry.segRo = null; entry._segload = null;
+  entry.seglayer = null; entry.markers = null; entry.busyEl = null;
 }
 
-// slider (live threshold) + 강조 (refit) button
-function buildBgCtl(entry) {
-  const bg = entry.bg;
-  const bar = document.createElement("div");
-  bar.className = "bgctl";
+// Adopt the point set the server settled on (auto-seed after a reset, or echoed back).
+function adoptSeg(entry, seg) {
+  if (!seg) return;
+  entry.seg = seg;
+  entry.points = (seg.points || []).map((p) => p.slice());
+  const meta = runMeta.get(entry.runId);
+  if (meta) meta.seg = seg;
+  drawMarkers(entry);
+}
 
-  const slider = document.createElement("input");
-  slider.type = "range"; slider.min = "0"; slider.max = "1"; slider.step = "0.01";
-  slider.className = "bgslider";
-  slider.value = String(bg.threshold);
-  slider.title = "Background threshold — patches scoring ≥ this are blacked out";
+function setSegBusy(entry, on) {
+  entry.segBusy = on;
+  entry.cell.classList.toggle("segbusy", on);
+  if (on && !entry.busyEl && entry.seglayer) {
+    const b = document.createElement("div");
+    b.className = "seg-spin";
+    b.innerHTML = `<span class="spin big"></span>`;
+    entry.seglayer.appendChild(b);
+    entry.busyEl = b;
+  } else if (!on && entry.busyEl) {
+    entry.busyEl.remove(); entry.busyEl = null;
+  }
+}
 
-  const fit = document.createElement("button");
-  fit.className = "bgfit";
-  fit.textContent = "강조";
-  fit.title = "Re-fit the PCA colors over the current foreground (강조)";
+// Swap in the freshly re-baked pca.mp4 (cache-busted) without dropping playback.
+function reloadSegVideo(entry) {
+  const meta = runMeta.get(entry.runId);
+  if (!meta || !entry.video) return;
+  const wasPlaying = master() && !master().paused;
+  entry.video.addEventListener("loadeddata", () => {
+    drawMarkers(entry);
+    if (wasPlaying) { entry.video.play().catch(() => {}); syncOne(entry.video); }
+  }, { once: true });
+  entry.video.src = meta.pcaUrl + "?v=" + Date.now();
+  entry.video.load();
+}
 
-  const syncFit = () => { fit.disabled = Math.abs(bg.threshold - bg.fitted_threshold) <= 0.005; };
-  syncFit();
-
-  slider.addEventListener("input", () => {          // live: redraw immediately
-    bg.threshold = parseFloat(slider.value);
-    paintMask(entry);
-    syncFit();
-  });
-  slider.addEventListener("change", () => {         // release: persist position (no render)
-    fetch(`/api/runs/${entry.runId}/threshold`, {
+// POST the current point set (empty => server re-auto-seeds), then reload the video.
+async function submitSeg(entry) {
+  if (entry.segBusy) return;
+  setSegBusy(entry, true);
+  try {
+    const r = await fetch(`/api/runs/${entry.runId}/segment`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ threshold: bg.threshold }),
-    }).catch(() => {});
-  });
+      body: JSON.stringify({ points: entry.points }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) throw new Error(d.detail || "segment failed");
+    adoptSeg(entry, d.seg);
+    reloadSegVideo(entry);
+  } catch { /* keep the current points; the user can retry */ }
+  finally { setSegBusy(entry, false); }
+}
 
-  fit.addEventListener("click", async () => {
-    const target = bg.threshold;
-    fit.disabled = true; fit.classList.add("busy");
-    const label = fit.textContent; fit.textContent = "…";
-    try {
-      const r = await fetch(`/api/runs/${entry.runId}/refit`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threshold: target }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || !d.ok) throw new Error(d.detail || "refit failed");
-      if (d.bg) { bg.threshold = d.bg.threshold; bg.fitted_threshold = d.bg.fitted_threshold; }
-      else { bg.fitted_threshold = target; }
-      slider.value = String(bg.threshold);
-      const meta = runMeta.get(entry.runId);
-      if (meta && entry.video) {                    // reload the new (unmasked) colors
-        const wasPlaying = master() && !master().paused;
-        entry.video.addEventListener("loadeddata", () => {
-          sizeCanvas(entry);
-          if (wasPlaying) { entry.video.play().catch(() => {}); syncOne(entry.video); }
-        }, { once: true });
-        entry.video.src = meta.pcaUrl + "?v=" + Date.now();
-        entry.video.load();
-      }
-    } catch { /* error: keep the slider where it is, just re-enable */ }
-    finally { fit.textContent = label; fit.classList.remove("busy"); syncFit(); }
-  });
+async function refitSeg(entry) {
+  if (entry.segBusy) return;
+  setSegBusy(entry, true);
+  try {
+    const r = await fetch(`/api/runs/${entry.runId}/refit`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) throw new Error(d.detail || "refit failed");
+    if (d.seg) adoptSeg(entry, d.seg);
+    reloadSegVideo(entry);
+  } catch { /* leave colors as-is */ }
+  finally { setSegBusy(entry, false); }
+}
 
-  bar.appendChild(slider);
-  bar.appendChild(fit);
+// controls row: ↺ reset (re-auto-seed) + Refit (re-fit PCA colors over the foreground)
+function buildSegCtl(entry) {
+  const bar = document.createElement("div");
+  bar.className = "segctl";
+
+  const hint = document.createElement("span");
+  hint.className = "seghint";
+  hint.textContent = "click +  ·  alt −";
+  bar.appendChild(hint);
+
+  const reset = document.createElement("button");
+  reset.className = "segbtn reset";
+  reset.textContent = "↺";
+  reset.title = "Reset to the automatic seed";
+  reset.addEventListener("click", () => { entry.points = []; submitSeg(entry); });
+  bar.appendChild(reset);
+
+  const refit = document.createElement("button");
+  refit.className = "segbtn refit";
+  refit.textContent = "Refit";
+  refit.title = "Re-fit the PCA colors over the current foreground";
+  refit.addEventListener("click", () => refitSeg(entry));
+  bar.appendChild(refit);
+
   return bar;
 }
 

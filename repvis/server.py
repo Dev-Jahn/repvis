@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import re
 import shutil
 import tempfile
@@ -27,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import DEVICES, RUNS_DIR, SOURCES_DIR, STATIC_DIR, REGISTRY
 from .extract import flush_vram
-from .pipeline import refit_and_render, run_group
+from .pipeline import refit_and_render, run_group, segment_and_render
 
 app = FastAPI(title="repvis")
 
@@ -82,21 +81,30 @@ def _read_meta(rid: str) -> dict | None:
         return None
 
 
-def _bg_client(meta: dict | None) -> dict:
-    """The per-run bg object the client uses to build the threshold slider.
-    Missing mask material / meta -> {available: False}."""
-    if not meta or "bg" not in meta:
+def _seg_client(meta: dict | None) -> dict:
+    """The per-run seg object the client uses to place +/- points and map them
+    to source pixels. Missing seg material / meta -> {available: False}."""
+    if not meta or "seg" not in meta:
         return {"available": False}
-    return {**meta["bg"], "grid": meta.get("grid"),
+    return {**meta["seg"], "grid": meta.get("grid"),
             "frames": meta.get("frames"), "fps": meta.get("fps")}
 
 
-def _req_threshold(payload: dict) -> float:
-    """Parse+clamp a required numeric `threshold` in [0,1], or 400."""
-    t = payload.get("threshold")
-    if not isinstance(t, (int, float)) or isinstance(t, bool):
-        raise HTTPException(400, "threshold (number in [0,1]) required")
-    return min(1.0, max(0.0, float(t)))
+def _parse_points(payload: dict) -> list:
+    """Validate a segment request body: `points` must be a list (possibly empty)
+    of [number, number, 0|1]. Returns the point list or raises 400."""
+    pts = payload.get("points")
+    if not isinstance(pts, list):
+        raise HTTPException(400, "points (list of [x,y,label]) required")
+    out = []
+    for p in pts:
+        if (not isinstance(p, (list, tuple)) or len(p) != 3
+                or any(isinstance(v, bool) for v in p)
+                or not all(isinstance(v, (int, float)) for v in p[:2])
+                or p[2] not in (0, 1)):
+            raise HTTPException(400, "each point must be [number, number, 0|1]")
+        out.append([float(p[0]), float(p[1]), int(p[2])])
+    return out
 
 
 def _prune_runs():
@@ -130,7 +138,7 @@ def _persist_run(meta: dict):
     same (source, model) cell — a re-run supersedes it."""
     rid, sid, model = meta["run_id"], meta["source_id"], meta["model"]
     rmeta = meta.pop("run_meta", None)
-    if rmeta:  # lift grid/feat_dim/frames/fps/bg to meta top-level (machine-readable)
+    if rmeta:  # lift grid/feat_dim/frames/fps/frame_indices/seg to meta top-level
         meta.update(rmeta)
     (RUNS_DIR / rid / "meta.json").write_text(json.dumps(meta))
     for d in RUNS_DIR.glob("*"):
@@ -308,9 +316,9 @@ def workspace():
                              "original_url": f"/api/sources/{r['source_id']}/video"}
                             for rid, r in g["runs"].items()]}
                   for g in GROUPS.values() if g["status"] in ("queued", "running")]
-    for a in active:   # best-effort bg (in-flight meta may not exist yet)
+    for a in active:   # best-effort seg (in-flight meta may not exist yet)
         for run in a["runs"]:
-            run["bg"] = _bg_client(_read_meta(run["run_id"]))
+            run["seg"] = _seg_client(_read_meta(run["run_id"]))
     metas = []
     for d in RUNS_DIR.glob("*"):
         if d.is_dir() and d.name not in active_ids:
@@ -319,7 +327,7 @@ def workspace():
                 metas.append(m)
     metas.sort(key=lambda m: m.get("created", 0.0))
     runs = [{"run_id": m["run_id"], "source_id": m["source_id"], "model": m["model"],
-             "result": m["result"], "bg": _bg_client(m),
+             "result": m["result"], "seg": _seg_client(m),
              "pca_url": f"/api/runs/{m['run_id']}/pca",
              "original_url": f"/api/sources/{m['source_id']}/video"} for m in metas]
     return {"sources": srcs, "runs": runs, "active": active}
@@ -377,7 +385,7 @@ def create_runs(payload: dict = Body(...)):
     EXEC.submit(task)
     return {"group_id": gid, "model": model,
             "runs": [{"run_id": it["run_id"], "source_id": it["source_id"],
-                      "bg": _bg_client(_read_meta(it["run_id"])),
+                      "seg": _seg_client(_read_meta(it["run_id"])),
                       "pca_url": f"/api/runs/{it['run_id']}/pca",
                       "original_url": f"/api/sources/{it['source_id']}/video"}
                      for it in items]}
@@ -400,7 +408,7 @@ async def events(gid: str):
                     payload = {k: g[k] for k in ("status", "stage", "progress", "message", "error")}
                     payload["runs"] = {rid: {"source_id": r["source_id"], "status": r["status"],
                                              "result": r["result"],
-                                             "bg": _bg_client(r.get("run_meta"))}
+                                             "seg": _seg_client(r.get("run_meta"))}
                                        for rid, r in g["runs"].items()}
                     status = g["status"]
                 else:
@@ -425,35 +433,26 @@ def run_pca(rid: str):
     return FileResponse(p)
 
 
-@app.get("/api/runs/{rid}/bgscore")
-def run_bgscore(rid: str):
-    """Raw per-patch background score (uint8, shape T*gh*gw) for the client
-    slider. 404 when the run has no mask material."""
-    if not _safe_id(rid):
-        raise HTTPException(404)
-    p = RUNS_DIR / rid / "bgscore.u8"
-    if not p.exists():
-        raise HTTPException(404)
-    return FileResponse(p, media_type="application/octet-stream")
-
-
-@app.post("/api/runs/{rid}/refit")
-def run_refit(rid: str, payload: dict = Body(...)):
-    """Re-fit the display basis over the foreground at `threshold` and re-render
-    the run's PCA video (blocking, on the single GPU worker)."""
+@app.post("/api/runs/{rid}/segment")
+def run_segment(rid: str, payload: dict = Body(...)):
+    """(Re)segment the foreground from client +/- points and re-bake the run's
+    PCA video (blocking, on the single GPU worker). Empty `points` re-runs the
+    DINO-saliency auto-seed."""
     if not _safe_id(rid):
         raise HTTPException(404)
     rd = RUNS_DIR / rid
     if not (rd / "feats.f16").exists():
         raise HTTPException(404)
-    threshold = _req_threshold(payload)
+    points = _parse_points(payload)
     with LOCK:
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
     try:
-        bg = EXEC.submit(refit_and_render, rd, threshold).result()
+        seg = EXEC.submit(segment_and_render, rd, points).result()
     except HTTPException:
         raise
+    except FileNotFoundError:
+        raise HTTPException(404)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         raise HTTPException(500, str(e))
@@ -462,23 +461,36 @@ def run_refit(rid: str, payload: dict = Body(...)):
             flush_vram()
         except Exception:  # noqa: BLE001
             pass
-    return {"ok": True, "bg": bg}
+    return {"ok": True, "seg": seg}
 
 
-@app.post("/api/runs/{rid}/threshold")
-def run_threshold(rid: str, payload: dict = Body(...)):
-    """Persist the slider position (meta bg.threshold only; no render)."""
+@app.post("/api/runs/{rid}/refit")
+def run_refit(rid: str):
+    """Re-fit the display basis over the current foreground mask and re-render
+    the run's PCA video (blocking, on the single GPU worker)."""
     if not _safe_id(rid):
         raise HTTPException(404)
-    p = RUNS_DIR / rid / "meta.json"
-    meta = _read_meta(rid)
-    if not meta or "bg" not in meta:
+    rd = RUNS_DIR / rid
+    if not (rd / "feats.f16").exists():
         raise HTTPException(404)
-    meta["bg"]["threshold"] = _req_threshold(payload)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(meta))
-    os.replace(tmp, p)
-    return {"ok": True}
+    with LOCK:
+        if _active_run_ids():
+            raise HTTPException(409, "a run is in progress")
+    try:
+        seg = EXEC.submit(refit_and_render, rd).result()
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(404)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+    finally:
+        try:
+            flush_vram()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "seg": seg}
 
 
 @app.delete("/api/runs")

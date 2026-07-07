@@ -59,3 +59,8 @@ tasks:
     status: "done"
     origin: "user request 2026-07-07"
     notes: "related to fix/remove-bg-horizontal-planes; persists run features (~2-4GB/cell) for refit"
+  - id: feat/sam2-foreground-segmentation
+    title: "Replace feature-clustering remove_bg with SAM2 lightweight segmentation (auto DINO-saliency seed + / - click refine, temporal propagation, mask baked into PCA video)"
+    status: "active"
+    origin: "user pivot 2026-07-07"
+    notes: "supersedes the mask half of feat/per-cell-bg-threshold-refit; keeps the Refit(색 재fit) button"

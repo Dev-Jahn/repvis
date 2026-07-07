@@ -2,7 +2,7 @@
      Source of truth: tasks.yaml. Regenerated automatically on tasks.yaml edits. -->
 # Roadmap — repvis
 
-**Progress:** 2/8 done · 0 active · 0 blocked · generated 2026-07-07 05:24 UTC @ `858dfd8`
+**Progress:** 2/9 done · 1 active · 0 blocked · generated 2026-07-07 06:29 UTC @ `3aff231`
 
 ```mermaid
 flowchart TD
@@ -15,6 +15,7 @@ flowchart TD
         perf_bench_giant_huge_compile["<b>perf/bench-giant-huge-compile</b><br/>Benchmark FP8/compile<br/>gains for dinov2-giant and<br/>dinov3-vith16plus (huge+<br/>compile gain is only<br/>estimated ~+15%)"]
         feat_endpoint_access_control["<b>feat/endpoint-access-control</b><br/>Add access control to<br/>job/source endpoints; any<br/>reachable client that<br/>knows an id can currently<br/>fetch content"]
         feat_per_cell_bg_threshold_refit["<b>feat/per-cell-bg-threshold-refit</b><br/>Per-cell background<br/>threshold slider (live<br/>client mask) + refit-PCA-<br/>on-current-foreground<br/>button, reusing persisted<br/>features (no backbone re-<br/>run)"]
+        feat_sam2_foreground_segmentation["<b>feat/sam2-foreground-segmentation</b><br/>Replace feature-clustering<br/>remove_bg with SAM2<br/>lightweight segmentation<br/>(auto DINO-saliency seed +<br/>/ - click refine, temporal<br/>propagation, mask baked<br/>into PCA video)"]
     end
     classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#424242
     classDef active fill:#bbdefb,stroke:#1565c0,color:#0d2b56,stroke-width:2px
@@ -23,12 +24,14 @@ flowchart TD
     classDef dropped fill:#eeeeee,stroke:#bdbdbd,color:#9e9e9e,stroke-dasharray: 4 4
     class chore_adopt_jahns_workflow,feat_per_cell_bg_threshold_refit done
     class chore_push_remove_bg,fix_remove_bg_horizontal_planes,perf_parallel_joint_encode,spike_fp8_attention,perf_bench_giant_huge_compile,feat_endpoint_access_control pending
+    class feat_sam2_foreground_segmentation active
 ```
 
 ## Tasks
 
 | ID | Title | Status | Round | Deps | Anchor |
 |---|---|---|---|---|---|
+| `feat/sam2-foreground-segmentation` | Replace feature-clustering remove_bg with SAM2 lightweight segmentation (auto DINO-saliency seed + / - click refine, temporal propagation, mask baked into PCA video) | 🔵 active | — | — | — |
 | `chore/push-remove-bg` | Push the committed remove_bg robust-masking work (be04e13) to origin after a leak scan | ⬜ pending | — | — | — |
 | `feat/endpoint-access-control` | Add access control to job/source endpoints; any reachable client that knows an id can currently fetch content | ⬜ pending | — | — | — |
 | `fix/remove-bg-horizontal-planes` | remove_bg classifies large horizontal planes (floor/desk) as foreground; revisit with a geometric/semantic prior | ⬜ pending | — | — | — |

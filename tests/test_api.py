@@ -110,29 +110,27 @@ def test_full_joint_run_and_persistence(clips):
     for rid in rids:
         d = RUNS_DIR / rid
         assert (d / "pca.mp4").exists() and (d / "meta.json").exists()
-        # every run now persists its features + PCA state for later refit; bgscore
-        # only when the fg/bg split was non-degenerate.
+        # every run persists features + PCA state (+ SAM masks) for later re-seg/refit
         names = {p.name for p in d.iterdir()}
         assert {"pca.mp4", "meta.json", "feats.f16", "state.pt"} <= names
-        assert names <= {"pca.mp4", "meta.json", "feats.f16", "state.pt", "bgscore.u8"}
+        assert names <= {"pca.mp4", "meta.json", "feats.f16", "state.pt", "masks.u1"}
         assert client.get(f"/api/runs/{rid}/pca").status_code == 200
 
     ws = client.get("/api/workspace").json()
     assert set(rids) <= {r["run_id"] for r in ws["runs"]}
 
-    # per-cell background threshold + refit (reuses persisted features, no re-extract)
+    # SAM2 foreground: seg meta + re-segment from a point + auto reset + refit
     r0 = rids[0]
     meta = json.loads((RUNS_DIR / r0 / "meta.json").read_text())
-    assert all(k in meta for k in ("grid", "frames", "fps", "bg"))
-    if meta["bg"]["available"]:
-        assert client.get(f"/api/runs/{r0}/bgscore").status_code == 200
-        rf = client.post(f"/api/runs/{r0}/refit", json={"threshold": 0.9})  # high -> ample fg
-        assert rf.status_code == 200 and rf.json()["ok"]
-        assert client.get(f"/api/runs/{r0}/pca").status_code == 200
-    else:
-        assert client.get(f"/api/runs/{r0}/bgscore").status_code == 404
-    assert client.post(f"/api/runs/{r0}/threshold", json={"threshold": 0.5}).status_code == 200
-    assert client.post(f"/api/runs/{r0}/refit", json={}).status_code == 400   # missing threshold
+    assert all(k in meta for k in ("grid", "frames", "fps", "frame_indices", "seg"))
+    assert len(meta["frame_indices"]) == meta["frames"]
+    seg = client.post(f"/api/runs/{r0}/segment", json={"points": [[96, 54, 1]]})
+    assert seg.status_code == 200 and seg.json()["ok"]
+    assert client.post(f"/api/runs/{r0}/segment", json={"points": []}).status_code == 200   # auto reset
+    assert client.post(f"/api/runs/{r0}/refit", json={}).status_code == 200                 # no threshold
+    assert client.get(f"/api/runs/{r0}/pca").status_code == 200
+    assert client.post(f"/api/runs/{r0}/segment", json={"points": [[1, 2]]}).status_code == 400
+    assert client.post(f"/api/runs/{r0}/segment", json={"points": "x"}).status_code == 400
 
     # a re-run of the same (source, model) supersedes the old result on disk
     old = next(x["run_id"] for x in body["runs"] if x["source_id"] == sa)

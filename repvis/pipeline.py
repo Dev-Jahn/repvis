@@ -36,10 +36,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .config import REGISTRY, STREAM_CHUNK, proc_hw, select_devices
-from .extract import extract_unit_chunk, gray_field, warm_model
-from .pca import (BgCtx, _has_mask, fit_pca_state, project_chunk, refit_display,
-                  score_chunk)
+from . import sam
+from .config import (REGISTRY, SOURCES_DIR, STREAM_CHUNK, proc_hw,
+                     select_devices)
+from .extract import extract_unit_chunk, warm_model
+from .pca import fit_pca_state, project_chunk, refit_display
 from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
 
 _FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
@@ -239,7 +240,7 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
     """Drain a unit's decode queue through the model; hand features to the
     device's offload worker."""
     dq = unit["_dq"]
-    fit_parts: list[tuple[torch.Tensor, torch.Tensor]] = []   # (tokens, grid positions)
+    fit_parts: list[torch.Tensor] = []   # PCA-fit token samples
     n_chunks = math.ceil((unit["hi"] - unit["lo"]) / chunk)
     quota = max(1, math.ceil(unit["fit_quota"] / max(n_chunks, 1)))
     s_cmp = torch.cuda.Stream(device=dev)
@@ -256,9 +257,7 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
                 flat = feats.reshape(-1, feats.shape[-1])
                 take = min(flat.shape[0], quota)
                 sel = torch.randperm(flat.shape[0], device=flat.device)[:take]
-                npatch = unit["grid"][0] * unit["grid"][1]
-                # keep each token's grid position: remove_bg debiases by position
-                fit_parts.append((flat[sel].float(), (sel % npatch).to(torch.int32)))
+                fit_parts.append(flat[sel].float())
                 fev = torch.cuda.Event()
                 fev.record(s_cmp)
                 if not _cput(oq, (unit, feats, fev), g):   # offload dead/cancelled
@@ -269,23 +268,107 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
         _stop_decode(unit)      # always stop+join this unit's decoder
     g.check()
     with torch.cuda.stream(s_cmp):
-        unit["fit"] = (torch.cat([t for t, _ in fit_parts], 0).to("cpu"),
-                       torch.cat([p for _, p in fit_parts], 0).to("cpu")) if fit_parts else None
+        unit["fit"] = torch.cat(fit_parts, 0).to("cpu") if fit_parts else None
     s_cmp.synchronize()
 
 
-# ------------------------------------------------------------------- phase 2
-def _render_encode(chunks: list, state, out_path, ow: int, oh: int, fps: float,
-                   dev: str, g: _Group, tick=None, score_out: list | None = None):
-    """Prefetch host feature chunks -> GPU, project with `state` -> UNMASKED rgb,
-    upsample to (oh, ow) and NVENC-encode to `out_path`. Shared by the normal
-    phase-2 render and the live refit re-render.
+# ----------------------------------------------------- SAM2 foreground masks
+def _source_path(source_id: str) -> Path:
+    """Resolve a source_id back to its on-disk video (SOURCES_DIR/<id>/video.*)."""
+    vids = sorted((SOURCES_DIR / source_id).glob("video.*"))
+    if not vids:
+        raise FileNotFoundError(f"source video missing for {source_id}")
+    return vids[0]
 
-    `chunks`   : list of CPU fp16 (k, gh, gw, D) tensors in frame order; each is
-                 freed (set to None) once copied to the GPU.
-    `tick(k)`  : optional progress callback, rendered-frame count per chunk.
-    `score_out`: if a list, the per-chunk uint8 background score (k, gh, gw) is
-                 appended in frame order (requires mask material in `state`).
+
+def _decode_source_frames(path, indices) -> list[np.ndarray]:
+    """Decode EXACTLY `indices` from `path` (torchcodec, approximate seek) as a
+    list of (H, W, 3) uint8 RGB np arrays at SOURCE resolution, frame order —
+    so SAM masks align 1:1 with feats.f16 / the encoded video."""
+    from torchcodec.decoders import VideoDecoder
+    dec = VideoDecoder(str(path), device="cpu", seek_mode="approximate")
+    data = dec.get_frames_at(indices=[int(i) for i in indices]).data  # (T,3,H,W) uint8
+    arr = data.permute(0, 2, 3, 1).contiguous().numpy()               # (T,H,W,3)
+    return [arr[i] for i in range(arr.shape[0])]
+
+
+def _auto_seed(grid0: torch.Tensor, width: int, height: int) -> list[tuple[float, float, int]]:
+    """DINO-saliency auto seed: from a frame-0 grid feature (gh, gw, D), pick the
+    patch whose feature is farthest (L2) from the patch mean and map its centre to
+    a source pixel. Returns a single positive point [(x, y, 1)]."""
+    gh, gw, D = grid0.shape
+    x = grid0.reshape(-1, D).float()
+    sal = (x - x.mean(0)).norm(dim=1)          # (gh*gw,)
+    row, col = divmod(int(sal.argmax()), gw)
+    px = (col + 0.5) / gw * float(width)
+    py = (row + 0.5) / gh * float(height)
+    return [(px, py, 1)]
+
+
+def _resize_masks(m: torch.Tensor, oh: int, ow: int) -> torch.Tensor:
+    """(T, H, W) bool -> (T, oh, ow) bool via nearest resize (identity if already)."""
+    if m.shape[1] == oh and m.shape[2] == ow:
+        return m.bool()
+    return F.interpolate(m.float()[:, None], size=(oh, ow), mode="nearest")[:, 0] > 0.5
+
+
+def _segment(frames_np: list, points: list, dev: str, oh: int, ow: int,
+             seed_frame: int = 0) -> tuple[torch.Tensor, dict]:
+    """Run SAM2 from `points` over `frames_np`; return ((T, oh, ow) bool CPU mask,
+    seg dict). If segmentation fails/empties, fall back to an all-foreground mask
+    with seg.available False so the video still renders."""
+    T = len(frames_np)
+    try:
+        raw = sam.segment(frames_np, points, dev, seed_frame=seed_frame)  # (T,H,W) bool
+        masks = _resize_masks(raw, oh, ow)
+        available = bool(masks.any())
+    except Exception:  # noqa: BLE001
+        masks = torch.ones(T, oh, ow, dtype=torch.bool)
+        available = False
+    seg = {"available": available, "seed_frame": int(seed_frame),
+           "points": [[float(x), float(y), int(lab)] for (x, y, lab) in points]}
+    return masks, seg
+
+
+def _save_masks(run_dir: Path, masks: torch.Tensor):
+    """Persist (T, oh, ow) bool masks as packed bits (masks.u1)."""
+    np.packbits(masks.numpy().reshape(-1)).tofile(str(run_dir / "masks.u1"))
+
+
+def _load_masks(run_dir: Path, T: int, oh: int, ow: int) -> torch.Tensor:
+    """Load masks.u1 back into a (T, oh, ow) bool CPU tensor."""
+    raw = np.fromfile(str(run_dir / "masks.u1"), dtype=np.uint8)
+    bits = np.unpackbits(raw, count=T * oh * ow).reshape(T, oh, ow)
+    return torch.from_numpy(bits.astype(bool))
+
+
+def _mk_tick(emit, total: int, label: str):
+    """Progress callback for the re-render helpers (or None when emit is None)."""
+    if emit is None:
+        return None
+    prog = [0]
+
+    def tick(k):
+        prog[0] += k
+        emit(stage="encoding", progress=prog[0] / max(total, 1),
+             message=f"{label} {int(100 * prog[0] / max(total, 1))}%")
+
+    return tick
+
+
+# ------------------------------------------------------------------- phase 2
+def _bake_encode(chunks: list, state, masks: torch.Tensor, out_path, ow: int, oh: int,
+                 fps: float, dev: str, g: _Group, tick=None):
+    """Prefetch host feature chunks -> GPU, project with `state` -> rgb, upsample
+    to (oh, ow), MULTIPLY IN the per-frame SAM mask (resized nearest to (oh, ow)),
+    then NVENC-encode to `out_path`. The single reusable "feats + state + masks ->
+    baked mp4" encoder, shared by run_group, segment_and_render and refit_and_render.
+
+    `chunks` : list of CPU fp16 (k, gh, gw, D) tensors in frame order; each is
+               freed (set to None) once copied to the GPU.
+    `masks`  : (T, H, W) bool CPU tensor in frame order (True = foreground); its
+               per-frame slice is baked onto each rendered frame.
+    `tick(k)`: optional progress callback, rendered-frame count per chunk.
 
     Same stream discipline as phase 1: render math on a side stream, the default
     stream stays reserved for torchcodec (NVENC submit).
@@ -317,6 +400,7 @@ def _render_encode(chunks: list, state, out_path, ow: int, oh: int, fps: float,
     default = torch.cuda.default_stream(dev)
     sink = None
     pt_started = False
+    base = 0
     try:
         # NOTE: state.to(dev) and GpuEncoder() must be inside the try so the
         # finally always runs (either can raise: H2D OOM / NVENC init failure).
@@ -336,20 +420,21 @@ def _render_encode(chunks: list, state, out_path, ow: int, oh: int, fps: float,
                 cf.record_stream(s_r)
                 rgb = project_chunk(cf, st).permute(0, 3, 1, 2)   # (k,3,gh,gw) float
                 k = rgb.shape[0]
+                mchunk = masks[base:base + k].to(dev).float()     # (k,H,W)
                 for j in range(0, k, 24):
                     up = F.interpolate(rgb[j:j + 24], size=(oh, ow), mode="bilinear", align_corners=False)
+                    mb = F.interpolate(mchunk[j:j + 24, None], size=(oh, ow), mode="nearest")  # (b,1,oh,ow)
+                    up = up * mb                              # bake the foreground mask
                     up = (up.clamp_(0, 1) * 255).round_().to(torch.uint8).contiguous()
                     rev = torch.cuda.Event()
                     rev.record(s_r)
                     default.wait_event(rev)               # encoder consumes on default
                     up.record_stream(default)
                     sink.submit(up)
-                if score_out is not None:                 # per-patch bg score, same stream
-                    sc = (score_chunk(cf, st) * 255.0).round_().clamp_(0, 255).to(torch.uint8)
-                    score_out.append(sc.to("cpu"))        # blocking D2H after the score kernels
             if tick is not None:
                 tick(k)
-            del cf, rgb
+            base += k
+            del cf, rgb, mchunk
         sink.close()
     except BaseException:
         if sink is not None:
@@ -363,8 +448,8 @@ def _render_encode(chunks: list, state, out_path, ow: int, oh: int, fps: float,
 
 
 def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
-    """Persist this source's dense features / bg score / PCA state, then encode
-    the UNMASKED PCA video from its host feature cache."""
+    """Persist this source's dense features + PCA state, auto-seed + run SAM2
+    foreground segmentation, then encode the PCA video with the mask baked in."""
     torch.cuda.set_device(dev)
     meta = src["meta"]
     ow, oh = _even(meta["width"]), _even(meta["height"])
@@ -378,17 +463,17 @@ def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
         for c in chunks:
             fh.write(c.numpy().tobytes())
 
-    has_mask = _has_mask(state)
-    score_out: list | None = [] if has_mask else None
-    _render_encode(chunks, state, src["out"], ow, oh, src["fps_out"], dev, g,
-                   tick=g.tick_render, score_out=score_out)
+    # auto-seed from frame-0 grid saliency, decode source frames, run SAM2
+    points = _auto_seed(chunks[0][0], meta["width"], meta["height"])
+    frames_np = _decode_source_frames(src["input"], src["indices"])
+    masks, seg = _segment(frames_np, points, dev, oh, ow)
+    del frames_np
 
-    if score_out is not None:   # per-patch background score for the live slider
-        with open(run_dir / "bgscore.u8", "wb") as fh:
-            for s in score_out:
-                fh.write(s.numpy().tobytes())
+    _bake_encode(chunks, state, masks, src["out"], ow, oh, src["fps_out"], dev, g,
+                 tick=g.tick_render)
+    _save_masks(run_dir, masks)
     torch.save(state.to("cpu"), run_dir / "state.pt")
-    emit_done(src)
+    emit_done(src, seg)
 
 
 # ---------------------------------------------------------------------- main
@@ -444,8 +529,10 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
     g = _Group(emit, total_n)
 
     # ---- warm models on every device that has work (parallel, once) ----
+    # both the feature extractor and SAM2 (used in phase-2 segmentation).
     used = sorted({devices[u["dev_idx"]] for u in units})
     threads = [threading.Thread(target=warm_model, args=(spec, d), daemon=True) for d in used]
+    threads += [threading.Thread(target=sam.warm_model, args=(d,), daemon=True) for d in used]
     for t in threads:
         t.start()
     for t in threads:
@@ -492,44 +579,24 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
     emit(stage="pca", progress=0.58,
          message="Fitting shared PCA basis…" if multi else "Fitting PCA basis…")
     primary = devices[0]
-    src_fit = []   # (tokens, positions) per source
+    src_fit = []   # pooled fit tokens per source
     for s in sources:
         parts = [u["fit"] for u in s["units"] if u["fit"] is not None]
         for u in s["units"]:
             u["fit"] = None
-        src_fit.append((torch.cat([t for t, _ in parts], 0),
-                        torch.cat([p for _, p in parts], 0)))
+        src_fit.append(torch.cat(parts, 0))
     if len(src_fit) > 1:   # a long source must not out-weight a short one
-        m = min(int(t.shape[0]) for t, _ in src_fit)
-        sel = [torch.randperm(t.shape[0])[:m] for t, _ in src_fit]
-        src_fit = [(t[i], p[i]) for (t, p), i in zip(src_fit, sel)]
-    fit_buf = torch.cat([t for t, _ in src_fit], 0).to(primary)
-    # Always compute mask material so every run can drive the live threshold
-    # slider (masking is applied at display time, not baked into the video). If
-    # the fg/bg split is degenerate, fit_pca_state leaves the state maskless
-    # (_has_mask false) and the slider stays disabled downstream.
-    fields = {}    # gray positional fields (one model forward per distinct grid, cached)
-    for s in sources:
-        gr = tuple(s["grid"])
-        if gr not in fields:
-            fields[gr] = gray_field(spec, primary, tuple(s["proc"]), gr)
-    bg = BgCtx(
-        pos=torch.cat([p for _, p in src_fit], 0).long().to(primary),
-        grid_id=torch.cat([torch.full((t.shape[0],), si, dtype=torch.long)
-                           for si, (t, _) in enumerate(src_fit)], 0).to(primary),
-        grids=[tuple(s["grid"]) for s in sources], fields=fields)
+        m = min(int(t.shape[0]) for t in src_fit)
+        src_fit = [t[torch.randperm(t.shape[0])[:m]] for t in src_fit]
+    fit_buf = torch.cat(src_fit, 0).to(primary)
     del src_fit
-    state = fit_pca_state(fit_buf, remove_bg=True,
-                          l2norm=bool(opts.get("l2norm", False)), bg=bg)
-    del fit_buf, bg
+    state = fit_pca_state(fit_buf, l2norm=bool(opts.get("l2norm", False)))
+    del fit_buf
 
     # ---- phase 2: render sources in parallel across devices ----
     emit(stage="encoding", progress=0.62, message="Rendering PCA video…")
 
-    has_mask = _has_mask(state)
-    t0 = float(state.bg_threshold)
-
-    def emit_done(src):
+    def emit_done(src, seg):
         meta, it = src["meta"], src["it"]
         gh, gw = src["grid"]
         ph, pw = src["proc"]
@@ -538,11 +605,10 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
                      "frames": len(src["indices"]),
                      "src_fps": round(meta["src_fps"], 2), "out_fps": round(max(1.0, src["fps_out"]), 2),
                      "grid": f"{gw}×{gh}", "proc": f"{pw}×{ph}", "gpus": ndev},
-             # lifted to meta top-level by the server (see refit_and_render / server persist)
+             # lifted to meta top-level by the server (see segment/refit + server persist)
              run_meta={"grid": [gh, gw], "feat_dim": int(state.mean.shape[0]),
                        "frames": len(src["indices"]), "fps": float(src["fps_out"]),
-                       "bg": {"available": has_mask, "threshold": t0,
-                              "fitted_threshold": t0}})
+                       "frame_indices": [int(i) for i in src["indices"]], "seg": seg})
 
     def render_worker(src, dev):
         try:
@@ -565,16 +631,10 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
     emit(stage="done", progress=1.0, message="Done")
 
 
-# ------------------------------------------------------------------- live refit
-def refit_and_render(run_dir: Path, threshold: float, emit=None) -> dict:
-    """Re-fit ONLY the display basis over the current foreground (patches with
-    background score < `threshold`) and re-render the UNMASKED PCA video from the
-    persisted dense features, atomically replacing runs/<rid>/pca.mp4.
-
-    Reuses the run's mask material (bg score is unchanged — only colors refit),
-    overwrites state.pt with the new state, updates meta's bg thresholds, and
-    returns the updated meta["bg"] dict. Runs on a GPU chosen via select_devices.
-    """
+def _load_run(run_dir: Path):
+    """Shared loader for the live segment/refit paths: parse meta, load the dense
+    features + PCA state, pick a device. Raises FileNotFoundError if feats.f16 is
+    missing (-> 404 upstream)."""
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "meta.json").read_text())
     gh, gw = int(meta["grid"][0]), int(meta["grid"][1])
@@ -588,47 +648,84 @@ def refit_and_render(run_dir: Path, threshold: float, emit=None) -> dict:
         raise FileNotFoundError(str(feats_p))
     feats = torch.from_numpy(
         np.fromfile(str(feats_p), dtype=np.float16).reshape(T, gh, gw, D))
-    score = torch.from_numpy(
-        np.fromfile(str(run_dir / "bgscore.u8"), dtype=np.uint8).reshape(T, gh, gw))
     state = torch.load(run_dir / "state.pt", map_location="cpu", weights_only=False)
 
     dev = select_devices()[0]
     if dev.startswith("cuda"):
         torch.cuda.set_device(dev)
+    return meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh)
 
-    # foreground tokens under the requested threshold, subsampled for the fit
-    fg = (score.reshape(-1).float() / 255.0) < float(threshold)
-    fg_tokens = feats.reshape(-1, D)[fg]
-    if fg_tokens.shape[0] < 16:
-        raise ValueError(f"threshold {float(threshold):.3f} leaves too little foreground to refit")
-    if fg_tokens.shape[0] > _FIT_MAX:
-        sel = torch.randperm(fg_tokens.shape[0])[:_FIT_MAX]
-        fg_tokens = fg_tokens[sel]
-    new_state = refit_display(fg_tokens.to(dev), state.to(dev))
 
-    # re-render the UNMASKED video from ALL features with the new display basis
-    chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
-    del feats
-    g = _Group(lambda **kw: None, max(T, 1))
-    tick = None
-    if emit is not None:
-        prog = [0]
-
-        def tick(k):
-            prog[0] += k
-            emit(stage="encoding", progress=prog[0] / max(T, 1),
-                 message=f"Re-rendering… {int(100 * prog[0] / max(T, 1))}%")
-
-    tmp = run_dir / "pca.refit.mp4"   # must keep a real video extension (encoder infers container)
+def _replace_video(fn, tmp: Path, dst: Path):
+    """Encode into `tmp` (a real .mp4 so torchcodec infers the container), then
+    atomically os.replace it onto `dst`; clean up the temp on failure."""
     try:
-        _render_encode(chunks, new_state, tmp, ow, oh, fps, dev, g, tick=tick)
+        fn(tmp)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.replace(tmp, run_dir / "pca.mp4")
+    os.replace(tmp, dst)
+
+
+# ------------------------------------------------------------ live segment / refit
+def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
+    """Re-segment a run from client point prompts and re-bake pca.mp4.
+
+    `points`: list of [x, y, label] (label 1 = foreground/+, 0 = background/-) in
+    SOURCE pixel coords. EMPTY -> recompute the DINO-saliency auto-seed from the
+    persisted frame-0 grid features. The source's exact sampled frame_indices are
+    re-decoded so the SAM masks align 1:1 with feats.f16 / the video. Persists
+    masks.u1 + meta['seg'], atomically replaces pca.mp4, returns meta['seg'].
+    """
+    run_dir = Path(run_dir)
+    meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
+
+    frames_np = _decode_source_frames(_source_path(meta["source_id"]), meta["frame_indices"])
+    H, W = frames_np[0].shape[:2]
+    pts = [(float(p[0]), float(p[1]), int(p[2])) for p in points]
+    if not pts:   # reset -> recompute the auto-seed from persisted feats frame-0 grid
+        pts = _auto_seed(feats[0], W, H)
+    masks, seg = _segment(frames_np, pts, dev, oh, ow)
+    del frames_np
+
+    chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
+    del feats
+    g = _Group(lambda **kw: None, max(T, 1))
+    _replace_video(
+        lambda tmp: _bake_encode(chunks, state, masks, tmp, ow, oh, fps, dev, g,
+                                 tick=_mk_tick(emit, T, "Segmenting…")),
+        run_dir / "pca.seg.mp4", run_dir / "pca.mp4")
+
+    _save_masks(run_dir, masks)
+    meta["seg"] = seg
+    (run_dir / "meta.json").write_text(json.dumps(meta))
+    return meta["seg"]
+
+
+def refit_and_render(run_dir: Path, emit=None) -> dict:
+    """Re-fit the display basis over the current mask's foreground grid tokens and
+    re-bake pca.mp4 with the SAME masks (no threshold). Overwrites state.pt and
+    returns meta['seg'] unchanged. Runs on a GPU chosen via select_devices."""
+    run_dir = Path(run_dir)
+    meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
+    masks = _load_masks(run_dir, T, oh, ow)
+
+    # downsample the pixel masks to the feature grid, gather foreground tokens
+    grid_mask = F.adaptive_avg_pool2d(masks.float().unsqueeze(1), (gh, gw)).squeeze(1) > 0.5
+    fg_tokens = feats.reshape(-1, D)[grid_mask.reshape(-1)]
+    if fg_tokens.shape[0] < 16:
+        raise ValueError("mask leaves too little foreground to refit")
+    if fg_tokens.shape[0] > _FIT_MAX:
+        fg_tokens = fg_tokens[torch.randperm(fg_tokens.shape[0])[:_FIT_MAX]]
+    new_state = refit_display(fg_tokens.to(dev), state.to(dev))
+
+    chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
+    del feats
+    g = _Group(lambda **kw: None, max(T, 1))
+    _replace_video(
+        lambda tmp: _bake_encode(chunks, new_state, masks, tmp, ow, oh, fps, dev, g,
+                                 tick=_mk_tick(emit, T, "Re-rendering…")),
+        run_dir / "pca.refit.mp4", run_dir / "pca.mp4")
 
     torch.save(new_state.to("cpu"), run_dir / "state.pt")
-    meta["bg"]["fitted_threshold"] = float(threshold)
-    meta["bg"]["threshold"] = float(threshold)
-    (run_dir / "meta.json").write_text(json.dumps(meta))
-    return meta["bg"]
+    return meta.get("seg", {"available": False})
