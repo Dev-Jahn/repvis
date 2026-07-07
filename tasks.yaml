@@ -143,3 +143,8 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "spike/frame-alignment-check"
+  - id: fix/auth-hardening
+    title: "Auth hardening follow-ups from review-2026-07-07 security pass (all minor, single-user LAN tool): POST /api/login has no rate-limit/backoff so REPVIS_TOKEN is brute-forceable; token+cookie travel cleartext over HTTP (no Secure/TLS) — document TLS/SSH-tunnel requirement or add optional TLS; static/index.html leaves the #t= URL fragment unstripped in open mode (strip regardless)."
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-07-review-fixes"
