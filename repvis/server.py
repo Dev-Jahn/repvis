@@ -150,13 +150,12 @@ def _persist_run(meta: dict):
         meta.update(rmeta)
     (RUNS_DIR / rid / "meta.json").write_text(json.dumps(meta))
     with LOCK:
-        protected = set(ACTIVE_RUN_MUTATIONS)
-    for d in RUNS_DIR.glob("*"):
-        if d.name == rid or not d.is_dir() or d.name in protected:
-            continue
-        m = _run_record(d)
-        if m and m.get("source_id") == sid and m.get("model") == model:
-            shutil.rmtree(d, ignore_errors=True)
+        for d in RUNS_DIR.glob("*"):
+            if d.name == rid or not d.is_dir() or d.name in ACTIVE_RUN_MUTATIONS:
+                continue
+            m = _run_record(d)
+            if m and m.get("source_id") == sid and m.get("model") == model:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def _emit(group: dict, **kw):
@@ -295,23 +294,19 @@ def delete_source(sid: str):
     """Remove a source and every result derived from it."""
     if not _safe_id(sid):
         raise HTTPException(404)
-    derived = []
-    for d in RUNS_DIR.glob("*"):
-        if d.is_dir():
-            m = _run_record(d)
-            if m and m.get("source_id") == sid:
-                derived.append(d)
     with LOCK:
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
         if sid not in SOURCES:
             raise HTTPException(404)
+        derived = [d for d in RUNS_DIR.glob("*")
+                   if d.is_dir() and (_run_record(d) or {}).get("source_id") == sid]
         if any(d.name in ACTIVE_RUN_MUTATIONS for d in derived):
             raise HTTPException(409, "a derived run is being segmented/refit")
         SOURCES.pop(sid)
-    shutil.rmtree(SOURCES_DIR / sid, ignore_errors=True)
-    for d in derived:
-        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(SOURCES_DIR / sid, ignore_errors=True)
+        for d in derived:
+            shutil.rmtree(d, ignore_errors=True)
     return {"ok": True}
 
 
@@ -456,10 +451,10 @@ def run_segment(rid: str, payload: dict = Body(...)):
     if not _safe_id(rid):
         raise HTTPException(404)
     rd = RUNS_DIR / rid
-    if not (rd / "feats.f16").exists():
-        raise HTTPException(404)
     points = _parse_points(payload)
     with LOCK:
+        if not (rd / "feats.f16").exists():
+            raise HTTPException(404)
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
         ACTIVE_RUN_MUTATIONS.add(rid)
@@ -491,9 +486,9 @@ def run_refit(rid: str):
     if not _safe_id(rid):
         raise HTTPException(404)
     rd = RUNS_DIR / rid
-    if not (rd / "feats.f16").exists():
-        raise HTTPException(404)
     with LOCK:
+        if not (rd / "feats.f16").exists():
+            raise HTTPException(404)
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
         ACTIVE_RUN_MUTATIONS.add(rid)
@@ -523,11 +518,11 @@ def delete_runs():
     """Clear all completed results (in-flight groups and mutating runs untouched)."""
     with LOCK:
         skip = _active_run_ids() | ACTIVE_RUN_MUTATIONS
-    removed = 0
-    for d in RUNS_DIR.glob("*"):
-        if d.is_dir() and d.name not in skip:
-            shutil.rmtree(d, ignore_errors=True)
-            removed += 1
+        removed = 0
+        for d in RUNS_DIR.glob("*"):
+            if d.is_dir() and d.name not in skip:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
     return {"ok": True, "removed": removed}
 
 

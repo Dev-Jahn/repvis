@@ -724,7 +724,12 @@ def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
 
     _save_masks(run_dir, masks)
     meta["seg"] = seg
-    (run_dir / "meta.json").write_text(json.dumps(meta))
+    # atomic replace: a concurrent delete_source reads meta.json via _run_record to
+    # decide whether a run derives from the source, and a torn (truncated) read there
+    # would drop this in-flight run from that check and delete its source out from under us.
+    meta_tmp = run_dir / "meta.json.tmp"
+    meta_tmp.write_text(json.dumps(meta))
+    os.replace(meta_tmp, run_dir / "meta.json")
     return meta["seg"]
 
 
