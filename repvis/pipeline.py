@@ -42,7 +42,8 @@ from .config import (REGISTRY, SOURCES_DIR, STREAM_CHUNK, proc_hw,
                      select_devices)
 from .extract import extract_unit_chunk, warm_model
 from .pca import fit_pca_state, project_chunk, refit_display
-from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
+from .video_io import (GpuEncoder, GpuVideoSource, compute_indices,
+                       iter_frames_at, probe_video)
 
 _FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
 _MIN_SEG = 192       # don't split a source into segments smaller than this
@@ -339,14 +340,15 @@ def _source_path(source_id: str) -> Path:
 
 
 def _decode_source_frames(path, indices) -> list[np.ndarray]:
-    """Decode EXACTLY `indices` from `path` (torchcodec, approximate seek) as a
-    list of (H, W, 3) uint8 RGB np arrays at SOURCE resolution, frame order —
-    so SAM masks align 1:1 with feats.f16 / the encoded video."""
+    """Decode EXACTLY the frames at positions `indices` from `path` as a list of
+    (H, W, 3) uint8 RGB np arrays at SOURCE resolution, frame order. Uses the same
+    POSITIONAL sequential decode as phase-1 (video_io.iter_frames_at) — never
+    per-index seeking, whose index->frame mapping diverges across backends on VFR
+    clips — so SAM masks align 1:1 with feats.f16 / the encoded video."""
     from torchcodec.decoders import VideoDecoder
     dec = VideoDecoder(str(path), device="cpu", seek_mode="approximate")
-    data = dec.get_frames_at(indices=[int(i) for i in indices]).data  # (T,3,H,W) uint8
-    arr = data.permute(0, 2, 3, 1).contiguous().numpy()               # (T,H,W,3)
-    return [arr[i] for i in range(arr.shape[0])]
+    return [f.permute(1, 2, 0).contiguous().numpy()                    # (H,W,3)
+            for f in iter_frames_at(dec, [int(i) for i in indices])]
 
 
 def _auto_seed(grid0: torch.Tensor, width: int, height: int) -> list[tuple[float, float, int, int]]:

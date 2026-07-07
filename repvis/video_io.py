@@ -35,19 +35,58 @@ def probe_video(path) -> dict:
             "duration": duration, "src_fps": fps, "n_total": n_total}
 
 
+def iter_frames_at(dec, indices: list[int]):
+    """Yield the frames at ascending POSITIONS `indices` — (3, H, W) uint8 RGB on
+    the decoder's device — by decoding sequentially from the start, never seeking.
+
+    This is the single definition of "frame index" shared by phase-1 feature
+    extraction (NVDEC) and the SAM re-decode (CPU): index i = the i-th frame in
+    presentation order, exactly what ffmpeg emits. Index-seek APIs
+    (get_frames_at & co) cannot provide that: under seek_mode='approximate' they
+    map index -> index/avg_fps -> timestamp, which resolves DIFFERENT frames on
+    VFR clips (and per backend), and on NVDEC they crash outright on open-GOP /
+    stream-copy-trimmed uploads ("no more frames left to decode"); 'exact' seek
+    crashes on those same trims. Sequential decode has neither failure mode.
+    `_core.get_next_frame` is torchcodec's only no-seek stepping primitive
+    (version pinned in uv.lock); the public surface offers no equivalent.
+
+    Two decoder quirks are papered over, keeping both backends identical:
+      * NVDEC emits pre-roll frames (pts < stream begin) on `-ss -c copy` trims
+        that CPU/ffmpeg drop — those are skipped and not counted;
+      * if container metadata overcounts frames (imperfect uploads), the tail
+        clamps to the last real frame, mirroring approximate-seek's end-clamp,
+        so the caller always receives exactly len(indices) frames.
+    """
+    from torchcodec import _core
+    begin = float(dec.metadata.begin_stream_seconds or 0.0)
+    pos, last, eof = 0, None, False
+    for want in indices:
+        while not eof and pos <= want:
+            try:
+                data, pts, _dur = _core.get_next_frame(dec._decoder)
+            except IndexError:      # stream ended before metadata said it would
+                eof = True
+                break
+            if float(pts) < begin - 1e-6:   # NVDEC pre-roll junk on trimmed clips
+                continue
+            last, pos = data, pos + 1
+        if last is None:
+            raise RuntimeError(f"no decodable frames in {dec.metadata.duration_seconds}s stream")
+        yield last
+
+
 class GpuVideoSource:
     """NVDEC-decoded frames for an explicit index list, served in GPU chunks.
 
     The decoder is created on first iteration — torchcodec decoders are not
     thread-safe, so it must be built and driven by the same (decode) thread.
 
-    seek_mode='approximate' is deliberate, not a default: 'exact' is marginally
-    faster on pristine clips but CRASHES ("no more frames left to decode") on
-    real-world uploads with imperfect container metadata / open-GOP structure
-    (e.g. anything produced by `ffmpeg -ss -c copy`), where it walks past the
-    true stream end mid-batch. 'approximate' decodes those same clips fully.
-    We subsample to a few hundred frames anyway, so frame-exact seeking buys
-    nothing — robustness is the only thing that matters here.
+    Frames are selected POSITIONALLY via a sequential decode (iter_frames_at):
+    no per-index seeking, so the index -> frame mapping is identical to the CPU
+    SAM re-decode on every clip class (VFR, open-GOP, stream-copy trims) and
+    NVDEC's seek crashes on imperfect uploads never trigger. seek_mode is
+    'approximate' only so decoder CREATION skips the full-file scan ('exact'
+    scans, and its index walk crashes on trims anyway) — no seek ever happens.
     """
 
     def __init__(self, path, device: str, indices: list[int]):
@@ -70,12 +109,15 @@ class GpuVideoSource:
             self._dec = VideoDecoder(self.path, device=self.device, seek_mode="approximate")
         chunk = max(align, (chunk // align) * align)
         first = align if align > 1 else min(16, chunk)
-        i, size = 0, first
-        while i < self.n:
-            sub = self.indices[i:i + size]
-            yield i, self._dec.get_frames_at(indices=sub).data
-            i += len(sub)
-            size = chunk
+        i, size, buf = 0, first, []
+        for frame in iter_frames_at(self._dec, self.indices):
+            buf.append(frame)
+            if len(buf) == size:
+                yield i, torch.stack(buf)
+                i += size
+                size, buf = chunk, []
+        if buf:
+            yield i, torch.stack(buf)
 
     def close(self):
         self._dec = None
