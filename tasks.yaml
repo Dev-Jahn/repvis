@@ -123,3 +123,13 @@ tasks:
     status: done
     severity: "major"
     origin: "review-2026-07-07-sam2-foreground"
+  - id: fix/delete-mutation-stale-snapshot
+    title: "run-mutation mutex (fix/run-mutation-mutex) still races on a stale snapshot: DELETE /api/runs, DELETE /api/sources and _persist_run supersede compute skip/protected under LOCK then rmtree OUTSIDE it, so a segment/refit registered into ACTIVE_RUN_MUTATIONS after the snapshot has its run dir deleted mid-mutation (feats/meta/source rmtree'd under it). Make victim selection + mutation-registration atomic under LOCK (DELETING_RUNS/SOURCES set, or atomic-rename victims to .trash/<uuid> under lock then delete outside), move the feats.f16 precheck inside the lock block, and add a barrier concurrency regression test"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-review-fixes"
+  - id: fix/weighted-quantile-plotting-position
+    title: "_weighted_quantile docstring claims it 'matches torch.quantile when weights are equal' but its midpoint plotting-position CDF (cw-0.5w)/cw_n = (i-0.5)/n differs from torch.quantile's type-7 linear i/(n-1) at small token counts (e.g. n=16,q=0.02 clamps to the min while torch interpolates xs[0..1]); refit display range is then more outlier-sensitive on small fg masks. Either make the weighted quantile reduce to torch.quantile at equal weights or correct the docstring's equivalence claim"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-07-review-fixes"
