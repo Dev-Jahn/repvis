@@ -4,6 +4,23 @@ repvis is a web tool that visualizes the **dense patch-feature geometry of a vid
 
 ---
 
+## Rounds
+
+### 2026-07-07-sam2-foreground
+- **목표**: 패치-클러스터링 remove_bg(64×36 그리드라 경계가 뭉개지고 테두리부터 깎임)를 **SAM2 경량 세그멘테이션**으로 교체 — 자동 DINO-saliency 시드 + `/`−클릭 보정, 픽셀 정확 마스크를 PCA 영상에 베이크.
+- **Shipped**:
+  - `feat/sam2-foreground-segmentation` — SAM2(`sam2.1-hiera-tiny`, Apache-2.0) 세그: 자동 시드 + click(+)/alt-click(−) 보정, 시간축 전파, 마스크 베이크. `repvis/sam.py` 신규. (done · `071502a`)
+  - `feat/per-cell-bg-threshold-refit` — (선행) 셀별 threshold 슬라이더 + Refit 버튼; 마스크 부분은 SAM2로 대체, **Refit(색 재fit)은 유지**. (done · `3aff231`)
+  - `chore/adopt-jahns-workflow` — 하네스 채택(config·tasks·ADR-0000·CLAUDE.md·roadmap). (done · `858dfd8`)
+- **Gates**: 전용 gate 태스크 없음. 검증 — CPU pytest 5 pass/1 skip, **GPU pytest 6 pass**(joint run + segment + refit), 실브라우저 E2E(자동 세그 베이크 배경 ~82% 검정, +클릭 1회로 인물 픽셀 분리, marker/reset/Refit 동작).
+- **SSOT**: unchanged (SSOT 비활성 프로젝트).
+- **Dropped**: `fix/remove-bg-horizontal-planes` — remove_bg 자체가 폐기돼 obsolete.
+- **Decisions pending**: none.
+- **Review**: requested (`docs/reviews/2026-07-07-sam2-foreground-request.md`).
+- **Next**: `feat/sam-autoseed-quality`(자동 시드 개선), `perf/sam-session-cache`(클릭 지연 단축), `feat/endpoint-access-control`(!major). 미푸시 6커밋 push 대기.
+
+---
+
 ## Timeline
 
 ### 2026-06-23 — Initial build & first public release — `a56e51c`

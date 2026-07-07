@@ -15,4 +15,4 @@ review:
   require_ci: false
 
 state:
-  last_round_commit: null
+  last_round_commit: 071502ac85de130d551521f3e29d7735c5796c08
