@@ -69,12 +69,16 @@ def _weighted_quantile(x: torch.Tensor, w: torch.Tensor, qs) -> torch.Tensor:
     """Weighted quantiles of 1-D `x` (non-negative weights `w`, aligned to `x`).
 
     `qs` are fractions in [0, 1]. Linear interpolation on the weighted CDF using
-    the midpoint plotting position, which matches `torch.quantile` when weights
-    are equal."""
+    the plotting position `p_i = below_i / (below_i + above_i)`, where `below_i`
+    (`above_i`) is the total weight strictly below (above) sorted sample `i`. This
+    is the weighted generalization of `torch.quantile`'s type-7 rule `i/(n-1)`,
+    to which it reduces exactly when weights are equal. The plotting position is
+    monotone non-decreasing for non-negative weights."""
     order = torch.argsort(x)
     xs, ws = x[order], w[order]
     cw = torch.cumsum(ws, 0)
-    cdf = (cw - 0.5 * ws) / cw[-1].clamp_min(1e-12)
+    below = cw - ws                                # weight strictly below sample i
+    cdf = below / (cw[-1] - ws).clamp_min(1e-12)   # below / (below + above)
     q = torch.as_tensor(qs, device=x.device, dtype=x.dtype)
     hi = torch.searchsorted(cdf, q).clamp(max=xs.numel() - 1)
     lo = (hi - 1).clamp(min=0)
