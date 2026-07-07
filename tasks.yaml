@@ -39,16 +39,20 @@ tasks:
     severity: "minor"
     origin: "PROGRESS loose ends"
   - id: perf/parallel-joint-encode
+    notes: "GPU-validated do-not-merge: segmented+concat NVENC encode is NOT decoded-pixel-identical to single-session (max abs 14/255, 195/320 frames differ from the first segment seam) — h264_nvenc VBR is GOP-boundary-dependent, so the commit's bit-identity claim is false. Speed win also unproven at tested scale (fan-out slower due to spawn/concat overhead; NVENC not the bottleneck for small clips). Rework: deterministic constant-QP/intra-only encode (file-size cost) OR relax the bar to visually-equivalent + fix the claim. Draft on branch worktree-wf_4e94b8f6-467-5."
+    severity: "major"
     title: "Parallelize phase-2 NVENC encode across GPUs to lift the ~1.5x joint multi-GPU speedup ceiling"
     status: "pending"
     origin: "PROGRESS loose ends"
   - id: spike/fp8-attention
+    notes: "Bench evidence (2026-07-07, GPU6): torchao full-FP8 linear already measured 1.39x (giant) / 1.63x (vith16plus) / 1.65x (vitb16) end-to-end forward on sm_120 — confirms the spike's FLOP analysis that full-FP8 (not attention-only, capped ~1.35x) is where the ~2x-class win lives, and that sm_120 fp8 scaled-mm kernels are real (not a bf16 fallback). Remaining work = the fidelity gate: Phase 0 noise floor + Phase 1 feature/PCA-color parity per docs/spikes/fp8-attention.md + scripts/fp8_fidelity.py before any server adoption."
     title: "Evaluate FP8 attention for a true ~2x forward speedup versus its fidelity risk (currently unshipped)"
     status: "pending"
     origin: "PROGRESS loose ends"
   - id: perf/bench-giant-huge-compile
+    notes: "MEASURED (GPU6 sm_120, 1024px, torch 2.12.1+cu130, 20 iters): dinov2-giant baseline 992.5ms/32.2fps/7177MB -> compile 910.3ms/35.2fps/5306MB (1.09x) -> fp8 716.2ms/44.7fps/3873MB (1.39x). dinov3-vith16plus baseline 1376.9ms/46.5fps/8007MB -> compile 1066.4ms/60.0fps/5851MB (1.29x) -> fp8 841.8ms/76.0fps/5407MB (1.63x). Controls: vitb16 compile 1.48x/fp8 1.65x; large compile 1.10x. Verdict: giant compile ~+9% (below the ~+15% estimate; GEMM-bound like dinov2-large), vith16plus compile +29% (2x the estimate). torchao FP8 (Float8DynamicActivationFloat8WeightConfig) is the real win (1.39-1.63x + big VRAM cut) but is SPEED-only measured — PCA-color fidelity gate (spike/fp8-attention Phase 0/1) required before serving. Raw log: scripts/bench_backbone.py output 2026-07-07."
     title: "Benchmark FP8/compile gains for dinov2-giant and dinov3-vith16plus (huge+ compile gain is only estimated ~+15%)"
-    status: "pending"
+    status: "done"
     origin: "PROGRESS loose ends"
   - id: feat/endpoint-access-control
     title: "Add access control to job/source endpoints; any reachable client that knows an id can currently fetch content"
@@ -68,12 +72,14 @@ tasks:
     origin: "user pivot 2026-07-07"
     notes: "supersedes the mask half of feat/per-cell-bg-threshold-refit; keeps the Refit(색 재fit) button"
   - id: feat/sam-autoseed-quality
+    notes: "GPU-validated do-not-merge-as-is: the fill-frame hole hazard did NOT occur (negative point safe). BUT multi-positive seeding REGRESSES the target case — on busy backgrounds the extra top-k saliency peaks land on the salient background and pull it INTO the mask (hard_distractor 0.129->0.836; real_rollout -0.142), the opposite of the intended fix. Original single-point had 0 empty/under-covered frames on all test clips so the headline benefit was not reproduced (test-material limit: no natural subject-on-busy-bg clip). Tweak: gate extra positives (cap k / require a saliency-gap threshold before peaks 2..k), KEEP the negative point. Draft on branch worktree-wf_4e94b8f6-467-6."
     title: "Improve SAM2 auto-seed: single DINO-saliency point misses on some frames; try multi-point / better saliency / SAM auto-mask-gen fallback"
     status: "pending"
     origin: "round 2026-07-07"
   - id: perf/sam-session-cache
+    notes: "GPU-validated PASS and MERGED (e09c7d5): warm re-seg masks.u1 byte-matches cold (sha256, 3 regimes) and different points give different masks (true re-segment, not stale replay); click latency cold 2285ms -> warm 841ms (2.72x on the validation clip; ~1.8x on the draft's larger clip); idle cached session ~0 VRAM (CPU-resident session), host-RAM ~260MB/run, LRU bound 2. Rebase onto main preserved the single-LOCK delete discipline (drop_seg_cache inside LOCK before each rmtree) and the atomic meta.json write. GPU no-clobber test retargeted to sam.segment_session (the refine path's actual callee post-refactor; assertion unchanged)."
     title: "Persist the Sam2VideoInferenceSession / vision features per run so +/- click re-segmentation skips recomputation and cuts click latency"
-    status: "pending"
+    status: "done"
     origin: "round 2026-07-07"
   - id: fix/segment-click-frame-idx
     round: 2026-07-07-review-fixes
@@ -139,6 +145,7 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
   - id: fix/vfr-decode-alignment
+    notes: "GPU-CONFIRMED and worse than scoped: on VFR, NVDEC(phase-1 feats) vs CPU(SAM masks) approximate decode resolve DIFFERENT real frames per index (index 32 -> CPU frame32, NVDEC frame35). ALSO NVDEC cannot decode SPARSE open-GOP indices at all (raises 'no more frames left') where CPU succeeds — production subsamples frame_indices, so open-GOP uploads also misalign/crash, not just VFR. Only closed-GOP CFR is clean (11/11, diff<=2 rounding). seek_mode=exact unusable (crashes on -ss -c copy trims). Fix = single decode path (decode once, reuse for feats+SAM). Now higher priority (open-GOP is common)."
     title: "Frame alignment is NOT exact on VARIABLE-FRAME-RATE sources: seek_mode=approximate maps index->timestamp via AVERAGE fps, so phase-1 NVDEC feats and SAM CPU re-decode can resolve different frames per index on VFR (CPU-proven in tests/test_frame_alignment.py; CFR closed/open-GOP are fine). seek_mode=exact crashes on stream-copy-trimmed uploads so is not an option. Fix: single decode path (decode sampled frames once, reuse for feats+SAM) or guarantee identical backend+seek. First GPU-validate NVDEC-vs-CPU divergence on the VFR fixture per the spike's plan"
     status: "pending"
     severity: "major"
