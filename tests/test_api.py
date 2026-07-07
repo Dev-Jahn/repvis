@@ -3,6 +3,8 @@
     uv run pytest                      # API tests only
     REPVIS_TEST_GPU=1 uv run pytest    # + full joint-PCA run on GPU
 """
+import asyncio
+import hashlib
 import io
 import json
 import os
@@ -20,7 +22,7 @@ os.environ.setdefault("REPVIS_DATA_DIR", tempfile.mkdtemp(prefix="repvis-test-")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from fastapi import HTTPException  # noqa: E402
+from fastapi import HTTPException, UploadFile  # noqa: E402
 
 import repvis.server as srv  # noqa: E402
 from repvis import pipeline as pl  # noqa: E402
@@ -332,3 +334,63 @@ def test_refit_404s_when_run_dir_absent(monkeypatch):
         assert False, "expected 404"
     except HTTPException as e:
         assert e.status_code == 404
+
+
+def test_race_dup_upload_vs_delete_source(monkeypatch):
+    """Phantom-source barrier: a dup (identical-bytes) upload must not register sid
+    into SOURCES after a concurrent delete_source popped it and rmtree'd the dir.
+    Force the buggy interleaving: pause delete at its source-dir rmtree (holding
+    LOCK), then fire the dup upload so its dedup-check sees the still-present dir.
+    Invariant the fix upholds: SOURCES has sid IFF its dir exists -- never a phantom
+    entry pointing at a missing dir."""
+    data = b"upload-delete-phantom-regression\x00\x01\x02"
+    sid = hashlib.sha256(data).hexdigest()[:16]
+    # a prior identical upload already exists on disk + in the registry
+    sd = SOURCES_DIR / sid
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "video.mp4").write_bytes(data)
+    (sd / "meta.json").write_text(json.dumps({"name": sid, "ext": ".mp4", "size": len(data)}))
+    srv.SOURCES[sid] = {"id": sid, "name": sid, "ext": ".mp4", "size": len(data)}
+
+    at_seam = threading.Event()
+    seam_go = threading.Event()
+    real_rmtree = srv.shutil.rmtree
+
+    def _gated_rmtree(path, *a, **k):
+        if str(path) == str(SOURCES_DIR / sid) and not at_seam.is_set():
+            at_seam.set()
+            seam_go.wait(5)
+        return real_rmtree(path, *a, **k)
+
+    monkeypatch.setattr(srv.shutil, "rmtree", _gated_rmtree)
+
+    def _delete():
+        try:
+            srv.delete_source(sid)
+        except HTTPException:
+            pass
+
+    dth = threading.Thread(target=_delete)
+    dth.start()
+    assert at_seam.wait(5), "delete never reached its source-dir rmtree"
+
+    # delete is paused mid-rmtree while HOLDING LOCK; fire the dup upload.
+    def _upload():
+        uf = UploadFile(filename="dup.mp4", file=io.BytesIO(data))
+        try:
+            asyncio.run(srv.upload_source(uf))
+        except HTTPException:
+            pass
+
+    uth = threading.Thread(target=_upload)
+    uth.start()
+    time.sleep(0.3)            # let the upload reach (and, under the fix, block on) LOCK
+    seam_go.set()
+    dth.join(5)
+    uth.join(5)
+    assert not dth.is_alive() and not uth.is_alive()
+
+    has_entry = sid in srv.SOURCES
+    has_dir = (SOURCES_DIR / sid).is_dir()
+    _cleanup(sid)
+    assert has_entry == has_dir, f"phantom source: SOURCES={has_entry} dir={has_dir}"

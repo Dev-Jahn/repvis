@@ -243,24 +243,26 @@ async def upload_source(file: UploadFile = File(...)):
                 out.write(buf)
                 size += len(buf)
         if size == 0:
-            tmp.unlink(missing_ok=True)
             raise HTTPException(400, "empty upload")
         sid = h.hexdigest()[:16]
-        d = SOURCES_DIR / sid
-        if not d.exists():
-            d.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(tmp), str(d / ("video" + ext)))
-            (d / "meta.json").write_text(json.dumps(
-                {"name": file.filename or sid, "ext": ext, "size": size}))
-        else:
-            tmp.unlink(missing_ok=True)
+        rec = {"id": sid, "name": file.filename or sid, "ext": ext, "size": size}
+        # Materialize the on-disk dir and register the source as ONE critical
+        # section, re-checking presence inside the lock. delete_source pops SOURCES
+        # and rmtree's the dir under this same LOCK, so serializing here means a dup
+        # upload can never register sid after a concurrent delete removed the dir
+        # (the old phantom): we either see the dir still present (reuse it) or gone
+        # (a delete just won -> recreate from tmp before registering).
+        with LOCK:
+            d = SOURCES_DIR / sid
+            if not d.exists():
+                d.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(tmp), str(d / ("video" + ext)))
+                (d / "meta.json").write_text(json.dumps(
+                    {"name": file.filename or sid, "ext": ext, "size": size}))
+            SOURCES[sid] = rec
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
-
-    rec = {"id": sid, "name": file.filename or sid, "ext": ext, "size": size}
-    with LOCK:
-        SOURCES[sid] = rec
     return rec
 
 
