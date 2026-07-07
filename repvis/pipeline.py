@@ -351,17 +351,69 @@ def _decode_source_frames(path, indices) -> list[np.ndarray]:
             for f in iter_frames_at(dec, [int(i) for i in indices])]
 
 
-def _auto_seed(grid0: torch.Tensor, width: int, height: int) -> list[tuple[float, float, int, int]]:
-    """DINO-saliency auto seed: from a frame-0 grid feature (gh, gw, D), pick the
-    patch whose feature is farthest (L2) from the patch mean and map its centre to
-    a source pixel. Returns a single positive point [(x, y, 1, 0)] on seed frame 0."""
+def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
+               k: int = 5) -> list[tuple[float, float, int, int]]:
+    """Multi-point DINO-saliency auto seed from a frame-0 grid feature (gh, gw, D).
+
+    Saliency s = ||patch - patch_mean|| per patch: the minority foreground patches
+    sit far from the scene mean and score high, the majority background sits near
+    it and scores low. The old seed bet the whole segmentation on the single most
+    outlying patch, which can be a lone background distractor (a sign, a specular
+    highlight) or a subject edge — so SAM2 missed the subject on some frames.
+
+    Instead seed SAM2 with up to `k` POSITIVE prompts at the highest-saliency
+    patches, spread apart by non-maximum suppression (radius ~ 1/6 of the grid) so
+    they blanket the subject rather than clustering on one peak, plus one NEGATIVE
+    prompt at the least-salient patch on the frame border (the border ring is
+    background far more often than not — a safer anchor than a global minimum that
+    could land on a flat patch inside a frame-filling subject).
+
+    Extra positives are GATED (GPU-validated: ungated they regress busy-background
+    clips — the k>=2 saliency peaks land on salient background and pull it INTO
+    the mask). A peak is planted only if it plausibly lies on the SAME object as
+    the primary peak: its feature must be closer (cosine, DINO space) to peak 1's
+    feature than to the patch mean — the background prototype under the same
+    premise the saliency score rests on. Same object => features cluster => pass;
+    salient-but-different background (busy texture, a sign) => fail => skipped.
+    A relative criterion, no tuned absolute threshold.
+
+    Returns [(x, y, label, 0), ...] in source pixels (label 1 = fg, 0 = bg), all on
+    seed frame 0. Contract unchanged: a list of point prompts for `sam.segment`.
+    """
     gh, gw, D = grid0.shape
     x = grid0.reshape(-1, D).float()
-    sal = (x - x.mean(0)).norm(dim=1)          # (gh*gw,)
-    row, col = divmod(int(sal.argmax()), gw)
-    px = (col + 0.5) / gw * float(width)
-    py = (row + 0.5) / gh * float(height)
-    return [(px, py, 1, 0)]
+    mu = x.mean(0)                                      # background prototype (D,)
+    sal = (x - mu).norm(dim=1).reshape(gh, gw)          # (gh, gw)
+
+    def _to_px(row: int, col: int) -> tuple[float, float]:
+        return ((col + 0.5) / gw * float(width), (row + 0.5) / gh * float(height))
+
+    # positive prompts: greedy top-k peaks with spatial non-maximum suppression,
+    # same-object gated (see docstring) — peak 1 is always kept
+    rad = max(1, round(min(gh, gw) / 6))
+    work = sal.clone()
+    f1 = None                                           # primary peak's feature
+    pts: list[tuple[float, float, int, int]] = []
+    for _ in range(max(1, k)):
+        row, col = divmod(int(work.argmax()), gw)
+        if work[row, col].isneginf():             # grid exhausted by suppression
+            break
+        work[max(0, row - rad):row + rad + 1, max(0, col - rad):col + rad + 1] = float("-inf")
+        f = grid0[row, col].reshape(-1).float()
+        if f1 is None:
+            f1 = f
+        elif F.cosine_similarity(f, f1, dim=0) <= F.cosine_similarity(f, mu, dim=0):
+            continue                              # different object — don't plant it
+        px, py = _to_px(row, col)
+        pts.append((px, py, 1, 0))
+
+    # negative prompt: least-salient patch on the frame border (dominant background)
+    border = torch.ones(gh, gw, dtype=torch.bool)
+    border[1:-1, 1:-1] = False
+    row, col = divmod(int(sal.masked_fill(~border, float("inf")).argmin()), gw)
+    px, py = _to_px(row, col)
+    pts.append((px, py, 0, 0))
+    return pts
 
 
 def _resize_masks(m: torch.Tensor, oh: int, ow: int) -> torch.Tensor:
