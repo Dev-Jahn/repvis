@@ -4,6 +4,7 @@
     REPVIS_TEST_GPU=1 uv run pytest    # + full joint-PCA run on GPU
 """
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -109,11 +110,29 @@ def test_full_joint_run_and_persistence(clips):
     for rid in rids:
         d = RUNS_DIR / rid
         assert (d / "pca.mp4").exists() and (d / "meta.json").exists()
-        assert list(d.iterdir()) and {p.name for p in d.iterdir()} == {"pca.mp4", "meta.json"}
+        # every run now persists its features + PCA state for later refit; bgscore
+        # only when the fg/bg split was non-degenerate.
+        names = {p.name for p in d.iterdir()}
+        assert {"pca.mp4", "meta.json", "feats.f16", "state.pt"} <= names
+        assert names <= {"pca.mp4", "meta.json", "feats.f16", "state.pt", "bgscore.u8"}
         assert client.get(f"/api/runs/{rid}/pca").status_code == 200
 
     ws = client.get("/api/workspace").json()
     assert set(rids) <= {r["run_id"] for r in ws["runs"]}
+
+    # per-cell background threshold + refit (reuses persisted features, no re-extract)
+    r0 = rids[0]
+    meta = json.loads((RUNS_DIR / r0 / "meta.json").read_text())
+    assert all(k in meta for k in ("grid", "frames", "fps", "bg"))
+    if meta["bg"]["available"]:
+        assert client.get(f"/api/runs/{r0}/bgscore").status_code == 200
+        rf = client.post(f"/api/runs/{r0}/refit", json={"threshold": 0.9})  # high -> ample fg
+        assert rf.status_code == 200 and rf.json()["ok"]
+        assert client.get(f"/api/runs/{r0}/pca").status_code == 200
+    else:
+        assert client.get(f"/api/runs/{r0}/bgscore").status_code == 404
+    assert client.post(f"/api/runs/{r0}/threshold", json={"threshold": 0.5}).status_code == 200
+    assert client.post(f"/api/runs/{r0}/refit", json={}).status_code == 400   # missing threshold
 
     # a re-run of the same (source, model) supersedes the old result on disk
     old = next(x["run_id"] for x in body["runs"] if x["source_id"] == sa)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -26,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import DEVICES, RUNS_DIR, SOURCES_DIR, STATIC_DIR, REGISTRY
 from .extract import flush_vram
-from .pipeline import run_group
+from .pipeline import refit_and_render, run_group
 
 app = FastAPI(title="repvis")
 
@@ -73,6 +74,31 @@ def _run_record(d: Path) -> dict | None:
     return m if (d / "pca.mp4").exists() else None
 
 
+def _read_meta(rid: str) -> dict | None:
+    """meta.json of a run dir (completed or in-flight), or None if unreadable."""
+    try:
+        return json.loads((RUNS_DIR / rid / "meta.json").read_text())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _bg_client(meta: dict | None) -> dict:
+    """The per-run bg object the client uses to build the threshold slider.
+    Missing mask material / meta -> {available: False}."""
+    if not meta or "bg" not in meta:
+        return {"available": False}
+    return {**meta["bg"], "grid": meta.get("grid"),
+            "frames": meta.get("frames"), "fps": meta.get("fps")}
+
+
+def _req_threshold(payload: dict) -> float:
+    """Parse+clamp a required numeric `threshold` in [0,1], or 400."""
+    t = payload.get("threshold")
+    if not isinstance(t, (int, float)) or isinstance(t, bool):
+        raise HTTPException(400, "threshold (number in [0,1]) required")
+    return min(1.0, max(0.0, float(t)))
+
+
 def _prune_runs():
     """Startup GC: drop incomplete, orphaned (source gone) and superseded run
     dirs. Completed runs persist so the workspace survives restarts."""
@@ -103,6 +129,9 @@ def _persist_run(meta: dict):
     """Write a completed run's meta.json and retire the previous result for the
     same (source, model) cell — a re-run supersedes it."""
     rid, sid, model = meta["run_id"], meta["source_id"], meta["model"]
+    rmeta = meta.pop("run_meta", None)
+    if rmeta:  # lift grid/feat_dim/frames/fps/bg to meta top-level (machine-readable)
+        meta.update(rmeta)
     (RUNS_DIR / rid / "meta.json").write_text(json.dumps(meta))
     for d in RUNS_DIR.glob("*"):
         if d.name == rid or not d.is_dir():
@@ -118,16 +147,20 @@ def _emit(group: dict, **kw):
         rid = kw.pop("run_id", None)
         rstatus = kw.pop("run_status", None)
         rresult = kw.pop("result", None)
+        rmeta = kw.pop("run_meta", None)
         if rid is not None and rid in group["runs"]:
             r = group["runs"][rid]
             if rresult is not None:
                 r["result"] = rresult
+            if rmeta is not None:
+                r["run_meta"] = rmeta
             if rstatus is not None:
                 r["status"] = rstatus
             if rstatus == "done":
                 persist = {"run_id": rid, "source_id": r["source_id"],
                            "model": group["model"], "opts": group["opts"],
-                           "result": r["result"], "created": time.time()}
+                           "result": r["result"], "run_meta": r.get("run_meta"),
+                           "created": time.time()}
         group.update(kw)
         if kw.get("error"):
             group["status"] = "error"
@@ -275,6 +308,9 @@ def workspace():
                              "original_url": f"/api/sources/{r['source_id']}/video"}
                             for rid, r in g["runs"].items()]}
                   for g in GROUPS.values() if g["status"] in ("queued", "running")]
+    for a in active:   # best-effort bg (in-flight meta may not exist yet)
+        for run in a["runs"]:
+            run["bg"] = _bg_client(_read_meta(run["run_id"]))
     metas = []
     for d in RUNS_DIR.glob("*"):
         if d.is_dir() and d.name not in active_ids:
@@ -283,7 +319,7 @@ def workspace():
                 metas.append(m)
     metas.sort(key=lambda m: m.get("created", 0.0))
     runs = [{"run_id": m["run_id"], "source_id": m["source_id"], "model": m["model"],
-             "result": m["result"],
+             "result": m["result"], "bg": _bg_client(m),
              "pca_url": f"/api/runs/{m['run_id']}/pca",
              "original_url": f"/api/sources/{m['source_id']}/video"} for m in metas]
     return {"sources": srcs, "runs": runs, "active": active}
@@ -341,6 +377,7 @@ def create_runs(payload: dict = Body(...)):
     EXEC.submit(task)
     return {"group_id": gid, "model": model,
             "runs": [{"run_id": it["run_id"], "source_id": it["source_id"],
+                      "bg": _bg_client(_read_meta(it["run_id"])),
                       "pca_url": f"/api/runs/{it['run_id']}/pca",
                       "original_url": f"/api/sources/{it['source_id']}/video"}
                      for it in items]}
@@ -362,7 +399,8 @@ async def events(gid: str):
                     last = g["rev"]
                     payload = {k: g[k] for k in ("status", "stage", "progress", "message", "error")}
                     payload["runs"] = {rid: {"source_id": r["source_id"], "status": r["status"],
-                                             "result": r["result"]}
+                                             "result": r["result"],
+                                             "bg": _bg_client(r.get("run_meta"))}
                                        for rid, r in g["runs"].items()}
                     status = g["status"]
                 else:
@@ -385,6 +423,62 @@ def run_pca(rid: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p)
+
+
+@app.get("/api/runs/{rid}/bgscore")
+def run_bgscore(rid: str):
+    """Raw per-patch background score (uint8, shape T*gh*gw) for the client
+    slider. 404 when the run has no mask material."""
+    if not _safe_id(rid):
+        raise HTTPException(404)
+    p = RUNS_DIR / rid / "bgscore.u8"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="application/octet-stream")
+
+
+@app.post("/api/runs/{rid}/refit")
+def run_refit(rid: str, payload: dict = Body(...)):
+    """Re-fit the display basis over the foreground at `threshold` and re-render
+    the run's PCA video (blocking, on the single GPU worker)."""
+    if not _safe_id(rid):
+        raise HTTPException(404)
+    rd = RUNS_DIR / rid
+    if not (rd / "feats.f16").exists():
+        raise HTTPException(404)
+    threshold = _req_threshold(payload)
+    with LOCK:
+        if _active_run_ids():
+            raise HTTPException(409, "a run is in progress")
+    try:
+        bg = EXEC.submit(refit_and_render, rd, threshold).result()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+    finally:
+        try:
+            flush_vram()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "bg": bg}
+
+
+@app.post("/api/runs/{rid}/threshold")
+def run_threshold(rid: str, payload: dict = Body(...)):
+    """Persist the slider position (meta bg.threshold only; no render)."""
+    if not _safe_id(rid):
+        raise HTTPException(404)
+    p = RUNS_DIR / rid / "meta.json"
+    meta = _read_meta(rid)
+    if not meta or "bg" not in meta:
+        raise HTTPException(404)
+    meta["bg"]["threshold"] = _req_threshold(payload)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta))
+    os.replace(tmp, p)
+    return {"ok": True}
 
 
 @app.delete("/api/runs")

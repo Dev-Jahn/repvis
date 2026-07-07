@@ -24,7 +24,7 @@ strategies on real clips (see repo history for the study):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -109,6 +109,12 @@ class PCAState:
     cent: torch.Tensor | None = None        # (_MASK_K, _MASK_PCS)
     fg_clusters: torch.Tensor | None = None  # (_MASK_K,) bool
     fields: dict | None = None              # {(gh, gw): (gh*gw, D) centered field}
+    # continuous background score (higher = more background-like), for the live
+    # threshold slider: score = ((z_masked . bg_axis) - bg_lo)/(bg_hi - bg_lo).
+    bg_axis: torch.Tensor | None = None     # (_MASK_PCS,) fg->bg direction
+    bg_lo: torch.Tensor | None = None       # () score normalization low
+    bg_hi: torch.Tensor | None = None       # () score normalization high
+    bg_threshold: float = 0.5               # default keep-cutoff: fg iff score < t
 
     def to(self, device) -> "PCAState":
         """Non-mutating: returns a copy on `device` (states are shared across
@@ -120,15 +126,17 @@ class PCAState:
             self.lo.to(device), self.hi.to(device), self.remove_bg,
             opt(self.mask_mean), opt(self.mask_comps), opt(self.cent),
             opt(self.fg_clusters),
-            None if self.fields is None else {g: f.to(device) for g, f in self.fields.items()})
+            None if self.fields is None else {g: f.to(device) for g, f in self.fields.items()},
+            opt(self.bg_axis), opt(self.bg_lo), opt(self.bg_hi), self.bg_threshold)
 
 
 @torch.inference_mode()
 def _fit_mask(raw: torch.Tensor, bg: BgCtx):
     """Cluster debiased tokens and mark fg clusters via the border prior.
 
-    Returns (mask_mean, mask_comps, cent, fg_clusters, fg_token_mask, fields)
-    or None when the split is degenerate (then everything is kept, mask off).
+    Returns (mask_mean, mask_comps, cent, fg_clusters, fg_token_mask, fields,
+    bg_axis, bg_lo, bg_hi, bg_threshold) or None when the split is degenerate
+    (then everything is kept, mask off).
     """
     dev = raw.device
     fields = {tuple(g): (f.to(dev) - f.to(dev).mean(0)) for g, f in bg.fields.items()}
@@ -151,7 +159,20 @@ def _fit_mask(raw: torch.Tensor, bg: BgCtx):
     fg = fg_clusters[assign]
     if not fg_clusters.any() or fg_clusters.all() or fg.float().mean() < 0.02:
         return None
-    return mask_mean, mask_comps, cent, fg_clusters, fg, fields
+
+    # Continuous background score: project mask-space coords onto the fg->bg axis
+    # (bg cluster centroids minus fg cluster centroids). The binary border-prior
+    # split above becomes the DEFAULT cut on this axis; the slider then moves the
+    # cut smoothly, keeping a patch as foreground iff its score < threshold.
+    pf = cent[fg_clusters].mean(0)
+    pb = cent[~fg_clusters].mean(0)
+    bg_axis = F.normalize(pb - pf, dim=0)                 # (_MASK_PCS,)
+    s = z @ bg_axis                                       # (M,) higher = more bg
+    q = _quantile(s, [0.01, 0.99])
+    bg_lo, bg_hi = q[0], q[1]
+    mid = 0.5 * (pf + pb) @ bg_axis                       # fg/bg prototype midpoint
+    t0 = float(((mid - bg_lo) / (bg_hi - bg_lo).clamp_min(1e-6)).clamp(0.0, 1.0))
+    return mask_mean, mask_comps, cent, fg_clusters, fg, fields, bg_axis, bg_lo, bg_hi, t0
 
 
 @torch.inference_mode()
@@ -163,10 +184,13 @@ def fit_pca_state(fit_tokens: torch.Tensor, *, remove_bg: bool = False, l2norm: 
         x = F.normalize(x, dim=1)
 
     mask_mean = mask_comps = cent = fg_clusters = fields = fg = None
+    bg_axis = bg_lo = bg_hi = None
+    bg_threshold = 0.5
     if remove_bg and bg is not None:
         fitted = _fit_mask(fit_tokens.float(), bg)
         if fitted is not None:
-            mask_mean, mask_comps, cent, fg_clusters, fg, fields = fitted
+            (mask_mean, mask_comps, cent, fg_clusters, fg, fields,
+             bg_axis, bg_lo, bg_hi, bg_threshold) = fitted
 
     src = x[fg] if fg is not None else x       # display basis fit on fg only
     comps, mean = _fit(src, 3, src.shape[0])
@@ -181,25 +205,79 @@ def fit_pca_state(fit_tokens: torch.Tensor, *, remove_bg: bool = False, l2norm: 
         lo[c], hi[c] = q[0], q[1]
 
     return PCAState(l2norm, mean, comps, lo, hi, remove_bg,
-                    mask_mean, mask_comps, cent, fg_clusters, fields)
+                    mask_mean, mask_comps, cent, fg_clusters, fields,
+                    bg_axis, bg_lo, bg_hi, bg_threshold)
 
 
 @torch.inference_mode()
 def project_chunk(feats: torch.Tensor, st: PCAState) -> torch.Tensor:
-    """feats (T,H,W,D) -> rgb (T,H,W,3) in [0,1], using a fixed PCA state."""
+    """feats (T,H,W,D) -> UNMASKED rgb (T,H,W,3) in [0,1], using a fixed basis.
+
+    Background removal is no longer baked here — it is applied as a live,
+    thresholdable mask at display time (client) or on bake (`apply_mask`), so the
+    same encoded video serves any threshold. See `score_chunk`.
+    """
     T, H, W, D = feats.shape
     x = feats.reshape(-1, D).float()
     disp = F.normalize(x, dim=1) if st.l2norm else x
     z = (disp - st.mean) @ st.comps.T
     rgb = ((z - st.lo) / (st.hi - st.lo).clamp_min(1e-6)).clamp(0.0, 1.0)
-    if (st.remove_bg and st.cent is not None and st.fields is not None
-            and st.mask_mean is not None and st.mask_comps is not None
-            and st.fg_clusters is not None):
-        xd = (x.reshape(T, H * W, D) - st.fields[(H, W)]).reshape(-1, D)
-        zn = F.normalize(xd, dim=1)
-        a = torch.cdist((zn - st.mask_mean) @ st.mask_comps.T, st.cent).argmin(1)
-        m = st.fg_clusters[a].float().reshape(T, 1, H, W)
-        for _ in range(2):   # 3x3 majority filter: de-speckle the mask
-            m = (F.avg_pool2d(m, 3, 1, 1) > 0.5).float()
-        rgb = rgb * m.reshape(-1, 1)
     return rgb.reshape(T, H, W, 3)
+
+
+def _has_mask(st: PCAState) -> bool:
+    return (st.remove_bg and st.fields is not None and st.mask_mean is not None
+            and st.mask_comps is not None and st.bg_axis is not None
+            and st.bg_lo is not None and st.bg_hi is not None)
+
+
+@torch.inference_mode()
+def score_chunk(feats: torch.Tensor, st: PCAState) -> torch.Tensor:
+    """feats (T,H,W,D) -> per-patch background score (T,H,W) in [0,1].
+
+    Higher = more background-like. A patch is foreground iff score < threshold.
+    Requires mask material (`_has_mask`); the caller checks first.
+    """
+    assert (st.fields is not None and st.mask_mean is not None and st.mask_comps is not None
+            and st.bg_axis is not None and st.bg_lo is not None and st.bg_hi is not None)
+    T, H, W, D = feats.shape
+    x = feats.reshape(-1, D).float()
+    xd = (x.reshape(T, H * W, D) - st.fields[(H, W)]).reshape(-1, D)
+    zc = (F.normalize(xd, dim=1) - st.mask_mean) @ st.mask_comps.T
+    s = zc @ st.bg_axis
+    s = ((s - st.bg_lo) / (st.bg_hi - st.bg_lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+    return s.reshape(T, H, W)
+
+
+@torch.inference_mode()
+def apply_mask(rgb: torch.Tensor, score: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Black out background patches in rgb (T,H,W,3) given score (T,H,W).
+
+    Keep a patch iff score < threshold, then 2x 3x3 majority filter to de-speckle.
+    Mirrors the client-side compositor exactly (must stay in sync).
+    """
+    T, H, W, _ = rgb.shape
+    m = (score < threshold).float().reshape(T, 1, H, W)
+    for _ in range(2):
+        m = (F.avg_pool2d(m, 3, 1, 1) > 0.5).float()
+    return rgb * m.reshape(T, H, W, 1)
+
+
+@torch.inference_mode()
+def refit_display(fg_tokens: torch.Tensor, st: PCAState,
+                  percentiles=(2.0, 98.0)) -> PCAState:
+    """Re-fit ONLY the display basis (mean/comps/lo/hi) on `fg_tokens`, keeping
+    the mask material — the per-cell 'enhance' refit over the current foreground.
+    """
+    x = fg_tokens.float()
+    if st.l2norm:
+        x = F.normalize(x, dim=1)
+    comps, mean = _fit(x, 3, x.shape[0])
+    z = (x - mean) @ comps.T
+    p = [percentiles[0] / 100.0, percentiles[1] / 100.0]
+    lo = torch.empty(3, device=x.device)
+    hi = torch.empty(3, device=x.device)
+    for c in range(3):
+        q = _quantile(z[:, c], p)
+        lo[c], hi[c] = q[0], q[1]
+    return replace(st, mean=mean, comps=comps, lo=lo, hi=hi)

@@ -25,16 +25,21 @@ Peak GPU memory is O(one chunk); host RAM holds the fp16 feature cache
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import queue
 import threading
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from .config import REGISTRY, STREAM_CHUNK, proc_hw, select_devices
 from .extract import extract_unit_chunk, gray_field, warm_model
-from .pca import BgCtx, fit_pca_state, project_chunk
+from .pca import (BgCtx, _has_mask, fit_pca_state, project_chunk, refit_display,
+                  score_chunk)
 from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
 
 _FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
@@ -270,23 +275,25 @@ def _extract_unit(unit: dict, spec, dev: str, chunk: int, bs: int, g: _Group, oq
 
 
 # ------------------------------------------------------------------- phase 2
-def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
-    """Project + upsample + encode one source from its host feature cache.
+def _render_encode(chunks: list, state, out_path, ow: int, oh: int, fps: float,
+                   dev: str, g: _Group, tick=None, score_out: list | None = None):
+    """Prefetch host feature chunks -> GPU, project with `state` -> UNMASKED rgb,
+    upsample to (oh, ow) and NVENC-encode to `out_path`. Shared by the normal
+    phase-2 render and the live refit re-render.
 
-    Same stream discipline as phase 1: render math on a side stream, the
-    default stream stays reserved for torchcodec (NVENC submit).
+    `chunks`   : list of CPU fp16 (k, gh, gw, D) tensors in frame order; each is
+                 freed (set to None) once copied to the GPU.
+    `tick(k)`  : optional progress callback, rendered-frame count per chunk.
+    `score_out`: if a list, the per-chunk uint8 background score (k, gh, gw) is
+                 appended in frame order (requires mask material in `state`).
+
+    Same stream discipline as phase 1: render math on a side stream, the default
+    stream stays reserved for torchcodec (NVENC submit).
     """
-    torch.cuda.set_device(dev)
-    meta = src["meta"]
-    ow, oh = _even(meta["width"]), _even(meta["height"])
-    chunks = [c for u in src["units"] for c in u["cache"]]   # units are in order
-    for u in src["units"]:
-        u["cache"] = None
-
     pq: queue.Queue = queue.Queue(maxsize=2)
     stop_pre = threading.Event()
 
-    def prefetch_loop():   # pinned host -> GPU, own stream
+    def prefetch_loop():   # host -> GPU, own stream
         try:
             torch.cuda.set_device(dev)
             s_pre = torch.cuda.Stream()
@@ -314,7 +321,7 @@ def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
         # NOTE: state.to(dev) and GpuEncoder() must be inside the try so the
         # finally always runs (either can raise: H2D OOM / NVENC init failure).
         st = state.to(dev)
-        sink = GpuEncoder(src["out"], ow, oh, src["fps_out"], dev)
+        sink = GpuEncoder(out_path, ow, oh, fps, dev)
         pt.start()
         pt_started = True
         while True:
@@ -337,7 +344,11 @@ def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
                     default.wait_event(rev)               # encoder consumes on default
                     up.record_stream(default)
                     sink.submit(up)
-            g.tick_render(k)
+                if score_out is not None:                 # per-patch bg score, same stream
+                    sc = (score_chunk(cf, st) * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+                    score_out.append(sc.to("cpu"))        # blocking D2H after the score kernels
+            if tick is not None:
+                tick(k)
             del cf, rgb
         sink.close()
     except BaseException:
@@ -349,6 +360,34 @@ def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
         _drain(pq)               # unblock prefetch parked on a full queue
         if pt_started:
             pt.join()
+
+
+def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
+    """Persist this source's dense features / bg score / PCA state, then encode
+    the UNMASKED PCA video from its host feature cache."""
+    torch.cuda.set_device(dev)
+    meta = src["meta"]
+    ow, oh = _even(meta["width"]), _even(meta["height"])
+    run_dir = src["out"].parent
+    chunks = [c for u in src["units"] for c in u["cache"]]   # units are in order
+    for u in src["units"]:
+        u["cache"] = None
+
+    # full dense features -> disk (fp16, C-contiguous, frame order) for later refit
+    with open(run_dir / "feats.f16", "wb") as fh:
+        for c in chunks:
+            fh.write(c.numpy().tobytes())
+
+    has_mask = _has_mask(state)
+    score_out: list | None = [] if has_mask else None
+    _render_encode(chunks, state, src["out"], ow, oh, src["fps_out"], dev, g,
+                   tick=g.tick_render, score_out=score_out)
+
+    if score_out is not None:   # per-patch background score for the live slider
+        with open(run_dir / "bgscore.u8", "wb") as fh:
+            for s in score_out:
+                fh.write(s.numpy().tobytes())
+    torch.save(state.to("cpu"), run_dir / "state.pt")
     emit_done(src)
 
 
@@ -465,27 +504,30 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
         sel = [torch.randperm(t.shape[0])[:m] for t, _ in src_fit]
         src_fit = [(t[i], p[i]) for (t, p), i in zip(src_fit, sel)]
     fit_buf = torch.cat([t for t, _ in src_fit], 0).to(primary)
-    remove_bg = bool(opts.get("remove_bg", False))
-    bg = None
-    if remove_bg:
-        # gray positional fields (one model forward per distinct grid, cached)
-        fields = {}
-        for s in sources:
-            gr = tuple(s["grid"])
-            if gr not in fields:
-                fields[gr] = gray_field(spec, primary, tuple(s["proc"]), gr)
-        bg = BgCtx(
-            pos=torch.cat([p for _, p in src_fit], 0).long().to(primary),
-            grid_id=torch.cat([torch.full((t.shape[0],), si, dtype=torch.long)
-                               for si, (t, _) in enumerate(src_fit)], 0).to(primary),
-            grids=[tuple(s["grid"]) for s in sources], fields=fields)
+    # Always compute mask material so every run can drive the live threshold
+    # slider (masking is applied at display time, not baked into the video). If
+    # the fg/bg split is degenerate, fit_pca_state leaves the state maskless
+    # (_has_mask false) and the slider stays disabled downstream.
+    fields = {}    # gray positional fields (one model forward per distinct grid, cached)
+    for s in sources:
+        gr = tuple(s["grid"])
+        if gr not in fields:
+            fields[gr] = gray_field(spec, primary, tuple(s["proc"]), gr)
+    bg = BgCtx(
+        pos=torch.cat([p for _, p in src_fit], 0).long().to(primary),
+        grid_id=torch.cat([torch.full((t.shape[0],), si, dtype=torch.long)
+                           for si, (t, _) in enumerate(src_fit)], 0).to(primary),
+        grids=[tuple(s["grid"]) for s in sources], fields=fields)
     del src_fit
-    state = fit_pca_state(fit_buf, remove_bg=remove_bg,
+    state = fit_pca_state(fit_buf, remove_bg=True,
                           l2norm=bool(opts.get("l2norm", False)), bg=bg)
     del fit_buf, bg
 
     # ---- phase 2: render sources in parallel across devices ----
     emit(stage="encoding", progress=0.62, message="Rendering PCA video…")
+
+    has_mask = _has_mask(state)
+    t0 = float(state.bg_threshold)
 
     def emit_done(src):
         meta, it = src["meta"], src["it"]
@@ -495,7 +537,12 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
              result={"width": _even(meta["width"]), "height": _even(meta["height"]),
                      "frames": len(src["indices"]),
                      "src_fps": round(meta["src_fps"], 2), "out_fps": round(max(1.0, src["fps_out"]), 2),
-                     "grid": f"{gw}×{gh}", "proc": f"{pw}×{ph}", "gpus": ndev})
+                     "grid": f"{gw}×{gh}", "proc": f"{pw}×{ph}", "gpus": ndev},
+             # lifted to meta top-level by the server (see refit_and_render / server persist)
+             run_meta={"grid": [gh, gw], "feat_dim": int(state.mean.shape[0]),
+                       "frames": len(src["indices"]), "fps": float(src["fps_out"]),
+                       "bg": {"available": has_mask, "threshold": t0,
+                              "fitted_threshold": t0}})
 
     def render_worker(src, dev):
         try:
@@ -516,3 +563,72 @@ def run_group(items: list[dict], model_key: str, opts: dict, emit):
         raise g.error
 
     emit(stage="done", progress=1.0, message="Done")
+
+
+# ------------------------------------------------------------------- live refit
+def refit_and_render(run_dir: Path, threshold: float, emit=None) -> dict:
+    """Re-fit ONLY the display basis over the current foreground (patches with
+    background score < `threshold`) and re-render the UNMASKED PCA video from the
+    persisted dense features, atomically replacing runs/<rid>/pca.mp4.
+
+    Reuses the run's mask material (bg score is unchanged — only colors refit),
+    overwrites state.pt with the new state, updates meta's bg thresholds, and
+    returns the updated meta["bg"] dict. Runs on a GPU chosen via select_devices.
+    """
+    run_dir = Path(run_dir)
+    meta = json.loads((run_dir / "meta.json").read_text())
+    gh, gw = int(meta["grid"][0]), int(meta["grid"][1])
+    D, T = int(meta["feat_dim"]), int(meta["frames"])
+    fps = float(meta["fps"])
+    res = meta["result"]
+    ow, oh = int(res["width"]), int(res["height"])
+
+    feats_p = run_dir / "feats.f16"
+    if not feats_p.exists():
+        raise FileNotFoundError(str(feats_p))
+    feats = torch.from_numpy(
+        np.fromfile(str(feats_p), dtype=np.float16).reshape(T, gh, gw, D))
+    score = torch.from_numpy(
+        np.fromfile(str(run_dir / "bgscore.u8"), dtype=np.uint8).reshape(T, gh, gw))
+    state = torch.load(run_dir / "state.pt", map_location="cpu", weights_only=False)
+
+    dev = select_devices()[0]
+    if dev.startswith("cuda"):
+        torch.cuda.set_device(dev)
+
+    # foreground tokens under the requested threshold, subsampled for the fit
+    fg = (score.reshape(-1).float() / 255.0) < float(threshold)
+    fg_tokens = feats.reshape(-1, D)[fg]
+    if fg_tokens.shape[0] < 16:
+        raise ValueError(f"threshold {float(threshold):.3f} leaves too little foreground to refit")
+    if fg_tokens.shape[0] > _FIT_MAX:
+        sel = torch.randperm(fg_tokens.shape[0])[:_FIT_MAX]
+        fg_tokens = fg_tokens[sel]
+    new_state = refit_display(fg_tokens.to(dev), state.to(dev))
+
+    # re-render the UNMASKED video from ALL features with the new display basis
+    chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
+    del feats
+    g = _Group(lambda **kw: None, max(T, 1))
+    tick = None
+    if emit is not None:
+        prog = [0]
+
+        def tick(k):
+            prog[0] += k
+            emit(stage="encoding", progress=prog[0] / max(T, 1),
+                 message=f"Re-rendering… {int(100 * prog[0] / max(T, 1))}%")
+
+    tmp = run_dir / "pca.refit.mp4"   # must keep a real video extension (encoder infers container)
+    try:
+        _render_encode(chunks, new_state, tmp, ow, oh, fps, dev, g, tick=tick)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, run_dir / "pca.mp4")
+
+    torch.save(new_state.to("cpu"), run_dir / "state.pt")
+    meta["bg"]["fitted_threshold"] = float(threshold)
+    meta["bg"]["threshold"] = float(threshold)
+    (run_dir / "meta.json").write_text(json.dumps(meta))
+    return meta["bg"]

@@ -2,7 +2,7 @@
      Source of truth: tasks.yaml. Regenerated automatically on tasks.yaml edits. -->
 # Roadmap — repvis
 
-**Progress:** 1/7 done · 0 active · 0 blocked · generated 2026-07-07 01:28 UTC @ `be04e13`
+**Progress:** 2/8 done · 0 active · 0 blocked · generated 2026-07-07 05:24 UTC @ `858dfd8`
 
 ```mermaid
 flowchart TD
@@ -14,13 +14,14 @@ flowchart TD
         spike_fp8_attention["<b>spike/fp8-attention</b><br/>Evaluate FP8 attention for<br/>a true ~2x forward speedup<br/>versus its fidelity risk<br/>(currently unshipped)"]
         perf_bench_giant_huge_compile["<b>perf/bench-giant-huge-compile</b><br/>Benchmark FP8/compile<br/>gains for dinov2-giant and<br/>dinov3-vith16plus (huge+<br/>compile gain is only<br/>estimated ~+15%)"]
         feat_endpoint_access_control["<b>feat/endpoint-access-control</b><br/>Add access control to<br/>job/source endpoints; any<br/>reachable client that<br/>knows an id can currently<br/>fetch content"]
+        feat_per_cell_bg_threshold_refit["<b>feat/per-cell-bg-threshold-refit</b><br/>Per-cell background<br/>threshold slider (live<br/>client mask) + refit-PCA-<br/>on-current-foreground<br/>button, reusing persisted<br/>features (no backbone re-<br/>run)"]
     end
     classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#424242
     classDef active fill:#bbdefb,stroke:#1565c0,color:#0d2b56,stroke-width:2px
     classDef blocked fill:#ffcdd2,stroke:#c62828,color:#7f1d1d
     classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b4332
     classDef dropped fill:#eeeeee,stroke:#bdbdbd,color:#9e9e9e,stroke-dasharray: 4 4
-    class chore_adopt_jahns_workflow done
+    class chore_adopt_jahns_workflow,feat_per_cell_bg_threshold_refit done
     class chore_push_remove_bg,fix_remove_bg_horizontal_planes,perf_parallel_joint_encode,spike_fp8_attention,perf_bench_giant_huge_compile,feat_endpoint_access_control pending
 ```
 
@@ -35,3 +36,4 @@ flowchart TD
 | `perf/parallel-joint-encode` | Parallelize phase-2 NVENC encode across GPUs to lift the ~1.5x joint multi-GPU speedup ceiling | ⬜ pending | — | — | — |
 | `spike/fp8-attention` | Evaluate FP8 attention for a true ~2x forward speedup versus its fidelity risk (currently unshipped) | ⬜ pending | — | — | — |
 | `chore/adopt-jahns-workflow` | Adopt the jahns-workflow harness (config, tasks.yaml, ADR-0000, CLAUDE.md stanza, generated views) | ✅ done | — | — | — |
+| `feat/per-cell-bg-threshold-refit` | Per-cell background threshold slider (live client mask) + refit-PCA-on-current-foreground button, reusing persisted features (no backbone re-run) | ✅ done | — | — | — |

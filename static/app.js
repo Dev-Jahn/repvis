@@ -74,7 +74,7 @@ async function loadWorkspace() {
 function restoreRun(run) {
   ensureColumn(run.model);
   ensureRow(run.source_id, run.original_url);
-  runMeta.set(run.run_id, { sid: run.source_id, model: run.model, pcaUrl: run.pca_url });
+  runMeta.set(run.run_id, { sid: run.source_id, model: run.model, pcaUrl: run.pca_url, bg: run.bg || null });
   setPcaCellRunning(run.source_id, run.model, run.run_id);
   fillPcaCell(run.run_id, run.result);
 }
@@ -212,7 +212,7 @@ function attachGroup(groupId, model, runsList) {
   ensureColumn(model);
   for (const run of runsList) {
     ensureRow(run.source_id, run.original_url);
-    runMeta.set(run.run_id, { sid: run.source_id, model, pcaUrl: run.pca_url });
+    runMeta.set(run.run_id, { sid: run.source_id, model, pcaUrl: run.pca_url, bg: run.bg || null });
     setPcaCellRunning(run.source_id, model, run.run_id);
   }
   showMatrix();
@@ -224,8 +224,11 @@ function attachGroup(groupId, model, runsList) {
     const d = JSON.parse(msg.data);
     setProgress(d.progress, d.message, d.status === "error");
     for (const [rid, r] of Object.entries(d.runs || {})) {
-      if (r.status === "done") fillPcaCell(rid, r.result);
-      else if (r.status === "error") setRunFailed(rid);
+      if (r.status === "done") {
+        const mm = runMeta.get(rid);       // pick up bg if the SSE done event carries it
+        if (mm && r.bg) mm.bg = r.bg;
+        fillPcaCell(rid, r.result);
+      } else if (r.status === "error") setRunFailed(rid);
     }
     updateBusyCells(groupRuns, d);
     if (d.status === "error") {
@@ -351,6 +354,7 @@ function removeRow(sid) {
     if (!entry) continue;
     pcaCells.delete(key);
     if (entry.runId) runMeta.delete(entry.runId);
+    stopMask(entry);
     unloadVideo(entry.video);
     if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();
     entry.cell.remove();
@@ -393,6 +397,7 @@ function relayout() {
 }
 
 function resetMatrix() {
+  for (const e of pcaCells.values()) stopMask(e);
   for (const v of allVideos()) unloadVideo(v);
   els.matrix.innerHTML = "";
   els.filterDefs.innerHTML = "";
@@ -417,6 +422,7 @@ function setPcaCellRunning(sid, model, runId) {
     entry = { cell, video: null, filter: null, runId, perm: [0, 1, 2], invert: [false, false, false] };
     pcaCells.set(key, entry);
   } else {
+    stopMask(entry);
     unloadVideo(entry.video);
     if (entry.filter && entry.filter.parentNode) entry.filter.parentNode.remove();  // drop old swizzle filter
     entry.filter = null;
@@ -449,6 +455,15 @@ function fillPcaCell(runId, result) {
   entry.cell.appendChild(buildCtl(entry, filter, result));
   entry.video = video;
   entry.filter = filter;
+
+  // live background-threshold mask overlay (bg source: fresh run -> result.bg,
+  // reload/re-attach -> the run entry's bg captured in runMeta)
+  const bg = (result && result.bg) || meta.bg || null;
+  entry.bg = bg;
+  if (bg && bg.available) {
+    startMask(entry);                          // inserts the mask <canvas> over the video
+    entry.cell.appendChild(buildBgCtl(entry)); // slider + 강조 refit button
+  }
 
   // join playback already in progress
   const m = master();
@@ -548,6 +563,210 @@ function buildCtl(entry, filter, result) {
     info.title = `${result.frames} frames · proc ${result.proc} · ${result.out_fps} fps · ${result.gpus} GPU(s)`;
     bar.appendChild(info);
   }
+  return bar;
+}
+
+// -------------------------------------------------- live background-threshold mask
+// Mirrors pca.apply_mask exactly: keep a patch iff score/255 < threshold, then two
+// passes of a 3x3 majority filter (avg_pool2d k=3 s=1 pad=1, count_include_pad -> /9,
+// > 0.5). Background patches are painted opaque black over the (swizzled) video; the
+// server's pca.mp4 stays unmasked, so masking is live and reversible client-side.
+
+function majority3(m, h, w) {
+  const out = new Float32Array(h * w);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let s = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;   // zero-padding (out of bounds counts as 0)
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          s += m[yy * w + xx];
+        }
+      }
+      out[y * w + x] = s / 9 > 0.5 ? 1 : 0;   // count_include_pad divides by 9
+    }
+  }
+  return out;
+}
+
+// Keep the canvas backing store matched to the displayed video box, then repaint.
+function sizeCanvas(entry) {
+  const v = entry.video, cv = entry.canvas;
+  if (!v || !cv) return;
+  const w = v.clientWidth, h = v.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  cv.style.height = h + "px";
+  paintMask(entry);
+}
+
+// Paint the mask for entry.frameIdx at the current threshold onto entry.canvas.
+function paintMask(entry) {
+  const bg = entry.bg, cv = entry.canvas, scores = entry.scores;
+  if (!cv || !scores || !bg) return;
+  const gh = bg.grid[0], gw = bg.grid[1], np = gh * gw;
+  const base = (entry.frameIdx | 0) * np;
+  const t = bg.threshold;
+  let m = new Float32Array(np);
+  for (let i = 0; i < np; i++) m[i] = scores[base + i] / 255 < t ? 1 : 0;   // 1 = foreground
+  m = majority3(m, gh, gw);
+  m = majority3(m, gh, gw);
+
+  // offscreen gw×gh: background opaque black (a=255), foreground transparent (a=0)
+  const octx = entry.offCtx;
+  const img = octx.createImageData(gw, gh);
+  const data = img.data;
+  for (let i = 0; i < np; i++) data[i * 4 + 3] = m[i] ? 0 : 255;   // rgb already 0
+  octx.putImageData(img, 0, 0);
+
+  // scale into the video's *content* rect (video is object-fit: contain) with
+  // smoothing on, to match the server's bilinear upsample of the mask.
+  const ctx = entry.ctx, cw = cv.width, ch = cv.height, v = entry.video;
+  const vw = v.videoWidth || gw, vh = v.videoHeight || gh;
+  const scale = Math.min(cw / vw, ch / vh);
+  const dw = vw * scale, dh = vh * scale, dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(entry.offCanvas, 0, 0, gw, gh, dx, dy, dw, dh);
+}
+
+async function loadBgScores(entry) {
+  try {
+    const r = await fetch(`/api/runs/${entry.runId}/bgscore`);
+    if (!r.ok) return;                       // 404 -> no scores, leave overlay blank
+    const buf = await r.arrayBuffer();
+    if (!entry.canvas) return;               // cell was torn down while fetching
+    entry.scores = new Uint8Array(buf);      // (frames, gh, gw) uint8, C-contiguous
+    sizeCanvas(entry);
+    if (entry._draw) entry._draw(entry.video.currentTime || 0);
+  } catch { /* offline — overlay stays blank */ }
+}
+
+function startMask(entry) {
+  const v = entry.video, bg = entry.bg;
+  const cv = document.createElement("canvas");
+  cv.className = "maskcanvas";
+  entry.canvas = cv;
+  entry.ctx = cv.getContext("2d");
+  const off = document.createElement("canvas");
+  off.width = bg.grid[1]; off.height = bg.grid[0];   // gw × gh
+  entry.offCanvas = off; entry.offCtx = off.getContext("2d");
+  entry.frameIdx = 0;
+  v.insertAdjacentElement("afterend", cv);           // sits above the video, below .ctl
+
+  entry.ro = new ResizeObserver(() => sizeCanvas(entry));
+  entry.ro.observe(v);
+
+  const draw = (mediaTime) => {
+    // Map playback position -> bgscore frame by TIME FRACTION over the real video
+    // duration. NVENC rounds a sub-1fps encode up, so bg.fps can disagree with the
+    // actual encoded rate; the duration ratio stays correct (frames == pca-video frames).
+    const dur = v.duration;
+    const idx = (dur && isFinite(dur) && dur > 0)
+      ? Math.floor((mediaTime / dur) * bg.frames)
+      : Math.round(mediaTime * bg.fps);
+    entry.frameIdx = Math.min(bg.frames - 1, Math.max(0, idx));
+    paintMask(entry);
+  };
+  entry._draw = draw;
+
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+    const cb = (now, md) => {
+      if (!entry.canvas) return;                      // stopped
+      draw(md.mediaTime);
+      entry._rvfc = v.requestVideoFrameCallback(cb);
+    };
+    entry._rvfc = v.requestVideoFrameCallback(cb);
+  } else {                                            // fallback: rAF ticker off currentTime
+    const tick = () => {
+      if (!entry.canvas) return;
+      draw(v.currentTime || 0);
+      entry._raf = requestAnimationFrame(tick);
+    };
+    entry._raf = requestAnimationFrame(tick);
+  }
+  v.addEventListener("loadeddata", () => { sizeCanvas(entry); draw(v.currentTime || 0); });
+
+  loadBgScores(entry);
+}
+
+function stopMask(entry) {
+  if (!entry) return;
+  if (entry._rvfc && entry.video && entry.video.cancelVideoFrameCallback)
+    entry.video.cancelVideoFrameCallback(entry._rvfc);
+  if (entry._raf) cancelAnimationFrame(entry._raf);
+  if (entry.ro) entry.ro.disconnect();
+  if (entry.canvas && entry.canvas.parentNode) entry.canvas.remove();
+  entry._rvfc = null; entry._raf = null; entry.ro = null;
+  entry.canvas = null; entry.ctx = null;
+  entry.offCanvas = null; entry.offCtx = null; entry.scores = null;
+}
+
+// slider (live threshold) + 강조 (refit) button
+function buildBgCtl(entry) {
+  const bg = entry.bg;
+  const bar = document.createElement("div");
+  bar.className = "bgctl";
+
+  const slider = document.createElement("input");
+  slider.type = "range"; slider.min = "0"; slider.max = "1"; slider.step = "0.01";
+  slider.className = "bgslider";
+  slider.value = String(bg.threshold);
+  slider.title = "Background threshold — patches scoring ≥ this are blacked out";
+
+  const fit = document.createElement("button");
+  fit.className = "bgfit";
+  fit.textContent = "강조";
+  fit.title = "Re-fit the PCA colors over the current foreground (강조)";
+
+  const syncFit = () => { fit.disabled = Math.abs(bg.threshold - bg.fitted_threshold) <= 0.005; };
+  syncFit();
+
+  slider.addEventListener("input", () => {          // live: redraw immediately
+    bg.threshold = parseFloat(slider.value);
+    paintMask(entry);
+    syncFit();
+  });
+  slider.addEventListener("change", () => {         // release: persist position (no render)
+    fetch(`/api/runs/${entry.runId}/threshold`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold: bg.threshold }),
+    }).catch(() => {});
+  });
+
+  fit.addEventListener("click", async () => {
+    const target = bg.threshold;
+    fit.disabled = true; fit.classList.add("busy");
+    const label = fit.textContent; fit.textContent = "…";
+    try {
+      const r = await fetch(`/api/runs/${entry.runId}/refit`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ threshold: target }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) throw new Error(d.detail || "refit failed");
+      if (d.bg) { bg.threshold = d.bg.threshold; bg.fitted_threshold = d.bg.fitted_threshold; }
+      else { bg.fitted_threshold = target; }
+      slider.value = String(bg.threshold);
+      const meta = runMeta.get(entry.runId);
+      if (meta && entry.video) {                    // reload the new (unmasked) colors
+        const wasPlaying = master() && !master().paused;
+        entry.video.addEventListener("loadeddata", () => {
+          sizeCanvas(entry);
+          if (wasPlaying) { entry.video.play().catch(() => {}); syncOne(entry.video); }
+        }, { once: true });
+        entry.video.src = meta.pcaUrl + "?v=" + Date.now();
+        entry.video.load();
+      }
+    } catch { /* error: keep the slider where it is, just re-enable */ }
+    finally { fit.textContent = label; fit.classList.remove("busy"); syncFit(); }
+  });
+
+  bar.appendChild(slider);
+  bar.appendChild(fit);
   return bar;
 }
 

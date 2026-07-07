@@ -54,3 +54,8 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "PROGRESS loose ends"
+  - id: feat/per-cell-bg-threshold-refit
+    title: "Per-cell background threshold slider (live client mask) + refit-PCA-on-current-foreground button, reusing persisted features (no backbone re-run)"
+    status: "done"
+    origin: "user request 2026-07-07"
+    notes: "related to fix/remove-bg-horizontal-planes; persists run features (~2-4GB/cell) for refit"
