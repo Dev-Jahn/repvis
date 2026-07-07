@@ -6,6 +6,21 @@ repvis is a web tool that visualizes the **dense patch-feature geometry of a vid
 
 ## Rounds
 
+### 2026-07-07-review-fixes
+- **목표**: gpt-5.5-pro 도메인 리뷰의 **REAL finding 5건 + refit 설계(ruling) + 공유 모델 로드 lock** 수정. 파일 단위 병렬 구현.
+- **Shipped** (`1262e15`):
+  - `fix/segment-click-frame-idx` **(blocker)** — 클릭에 프레임 관통(`[x,y,label,frame]`, duration 비율 계산, sam 프레임별 조건화 + reverse 전파). 예전엔 모든 클릭이 frame 0으로 해석돼 마스크 오염.
+  - `fix/sam-failure-silent-fallback` — `seg{available,error,empty}`, 실패해도 컨트롤 유지(복구), refine 실패는 비클로버.
+  - `fix/shared-model-load-lock` — 신규 `repvis/modelload.py` 공유 `LOAD_LOCK`(extractor↔SAM dtype race 차단).
+  - `fix/segment-point-validation` — finite/범위 검증(400/422).
+  - `fix/run-mutation-mutex` — segment/refit 중 DELETE/supersede 거부.
+  - `fix/refit-soft-weight-mask` — 하드 `avgpool>0.5` 폐기 → **fg-fraction 가중 PCA**(얇은 구조 보존). `decision/refit-mask-grid-threshold` ruling 반영.
+- **Gates**: CPU pytest 5/1, **GPU pytest 6**(4-tuple·validation·SAM-failure-no-clobber·mask-ratio·재디코드 결정성), 라이브 E2E(50% 재생 클릭 → `frame 24` 저장, 실패 시 UI 유지). ruff clean.
+- **Touched (not done)**: `spike/frame-alignment-check` — 재디코드 결정성 테스트 추가, 전체 VFR/open-GOP fixture + GPU↔CPU 정확성은 후속.
+- **SSOT**: unchanged.
+- **Review**: requested (`docs/reviews/2026-07-07-review-fixes-request.md`).
+- **Next**: `spike/frame-alignment-check`, `feat/sam-autoseed-quality`, `perf/sam-session-cache`, `feat/endpoint-access-control`(!major).
+
 ### 2026-07-07-sam2-foreground
 - **목표**: 패치-클러스터링 remove_bg(64×36 그리드라 경계가 뭉개지고 테두리부터 깎임)를 **SAM2 경량 세그멘테이션**으로 교체 — 자동 DINO-saliency 시드 + `/`−클릭 보정, 픽셀 정확 마스크를 PCA 영상에 베이크.
 - **Shipped**:
