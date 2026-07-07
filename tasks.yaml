@@ -31,7 +31,7 @@ tasks:
     notes: "ratified by ADR-0000"
   - id: chore/push-remove-bg
     title: "Push the committed remove_bg robust-masking work (be04e13) to origin after a leak scan"
-    status: "pending"
+    status: "done"
     origin: "PROGRESS loose ends"
   - id: fix/remove-bg-horizontal-planes
     title: "remove_bg classifies large horizontal planes (floor/desk) as foreground; revisit with a geometric/semantic prior"
@@ -52,7 +52,7 @@ tasks:
     origin: "PROGRESS loose ends"
   - id: feat/endpoint-access-control
     title: "Add access control to job/source endpoints; any reachable client that knows an id can currently fetch content"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "PROGRESS loose ends"
   - id: feat/per-cell-bg-threshold-refit
@@ -108,7 +108,7 @@ tasks:
   - id: spike/frame-alignment-check
     round: 2026-07-07-review-fixes
     title: "Verify 'frame alignment is exact': phase-1 GPU-decode vs SAM CPU re-decode both use seek_mode=approximate and tests only check index-length; add checksum/hash verification + open-GOP/VFR fixtures, or reuse one decode path"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-07-sam2-foreground"
   - id: decision/refit-mask-grid-threshold
@@ -130,11 +130,16 @@ tasks:
     origin: "review-2026-07-07-review-fixes"
   - id: fix/weighted-quantile-plotting-position
     title: "_weighted_quantile docstring claims it 'matches torch.quantile when weights are equal' but its midpoint plotting-position CDF (cw-0.5w)/cw_n = (i-0.5)/n differs from torch.quantile's type-7 linear i/(n-1) at small token counts (e.g. n=16,q=0.02 clamps to the min while torch interpolates xs[0..1]); refit display range is then more outlier-sensitive on small fg masks. Either make the weighted quantile reduce to torch.quantile at equal weights or correct the docstring's equivalence claim"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
   - id: fix/upload-delete-source-phantom
     title: "Duplicate upload racing DELETE /api/sources can re-register a source whose dir was just rmtree'd: upload_source's (SOURCES_DIR/sid).exists() check + dir handling run OUTSIDE LOCK and only SOURCES[sid]=rec is locked, so an identical-bytes re-upload taking the else-branch can insert sid into SOURCES after delete_source popped it and rmtree'd the dir -> phantom source (list/workspace advertise it, create_runs 404s) until a restart re-scan. Pre-existing; surfaced by review-2026-07-07-review-fixes adversarial pass"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
+  - id: fix/vfr-decode-alignment
+    title: "Frame alignment is NOT exact on VARIABLE-FRAME-RATE sources: seek_mode=approximate maps index->timestamp via AVERAGE fps, so phase-1 NVDEC feats and SAM CPU re-decode can resolve different frames per index on VFR (CPU-proven in tests/test_frame_alignment.py; CFR closed/open-GOP are fine). seek_mode=exact crashes on stream-copy-trimmed uploads so is not an option. Fix: single decode path (decode sampled frames once, reuse for feats+SAM) or guarantee identical backend+seek. First GPU-validate NVDEC-vs-CPU divergence on the VFR fixture per the spike's plan"
+    status: "pending"
+    severity: "major"
+    origin: "spike/frame-alignment-check"
