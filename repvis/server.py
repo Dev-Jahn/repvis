@@ -12,7 +12,9 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -21,11 +23,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import DEVICES, RUNS_DIR, SOURCES_DIR, STATIC_DIR, REGISTRY
+from .config import AUTH_TOKEN, DEVICES, RUNS_DIR, SOURCES_DIR, STATIC_DIR, REGISTRY
 from .extract import flush_vram
 from .pipeline import refit_and_render, run_group, segment_and_render
 
@@ -191,6 +193,71 @@ def _emit(group: dict, **kw):
         group["rev"] += 1
     if persist:   # disk I/O outside the lock; only the single worker gets here
         _persist_run(persist)
+
+
+# --------------------------------------------------------------- access control
+# Shared-token gate. When AUTH_TOKEN is set (non-empty) every request must carry
+# the token via `Authorization: Bearer <t>`, an `X-Repvis-Token` header, or the
+# `repvis_token` cookie; POST /api/login trades the token for that cookie so the
+# browser (video/img/EventSource, which can't set headers) authenticates too.
+# When AUTH_TOKEN is unset the gate is disabled (open) — see the startup warning.
+# AUTH_TOKEN is read as a module global on every request so tests can toggle it.
+AUTH_COOKIE = "repvis_token"
+_AUTH_EXEMPT = frozenset({"/", "/api/login", "/api/auth"})
+
+if not AUTH_TOKEN:
+    print("repvis: REPVIS_TOKEN is not set — running WITHOUT access control; "
+          "every source video, run and API route is publicly reachable.",
+          file=sys.stderr)
+
+
+def _authorized(request: Request, token: str) -> bool:
+    """True iff the request presents `token` via Bearer / X-Repvis-Token / cookie
+    (constant-time compare; any one matching source is enough)."""
+    tb = token.encode()
+    cands = []
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        cands.append(auth[7:])
+    xt = request.headers.get("x-repvis-token")
+    if xt is not None:
+        cands.append(xt)
+    ck = request.cookies.get(AUTH_COOKIE)
+    if ck is not None:
+        cands.append(ck)
+    return any(secrets.compare_digest(c.encode(), tb) for c in cands)
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    token = AUTH_TOKEN
+    if token and request.url.path not in _AUTH_EXEMPT and not _authorized(request, token):
+        return JSONResponse({"detail": "authentication required"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/api/auth")
+def auth_status():
+    """Whether the server enforces the shared token (so the UI knows to prompt)."""
+    return {"required": bool(AUTH_TOKEN)}
+
+
+@app.post("/api/login")
+def login(request: Request, payload: dict = Body(default={})):
+    """Trade a valid token (JSON {"token": …} or a Bearer / X-Repvis-Token header)
+    for the httpOnly `repvis_token` cookie. No-op when auth is disabled."""
+    token = AUTH_TOKEN
+    if not token:
+        return {"ok": True, "required": False}
+    body_tok = payload.get("token")
+    ok = ((body_tok is not None
+           and secrets.compare_digest(str(body_tok).encode(), token.encode()))
+          or _authorized(request, token))
+    if not ok:
+        raise HTTPException(401, "invalid token")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="strict", path="/")
+    return resp
 
 
 # ------------------------------------------------------------------ static/info

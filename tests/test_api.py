@@ -394,3 +394,84 @@ def test_race_dup_upload_vs_delete_source(monkeypatch):
     has_dir = (SOURCES_DIR / sid).is_dir()
     _cleanup(sid)
     assert has_entry == has_dir, f"phantom source: SOURCES={has_entry} dir={has_dir}"
+
+
+# ------------------------------------------------------- shared-token access control
+TOKEN = "s3cr3t-test-token"
+
+
+@pytest.fixture
+def auth_on():
+    """Enforce the shared token for the duration of a test, then restore open mode
+    (default) so the other tests are unaffected."""
+    prev = srv.AUTH_TOKEN
+    srv.AUTH_TOKEN = TOKEN
+    try:
+        yield TOKEN
+    finally:
+        srv.AUTH_TOKEN = prev
+
+
+def test_auth_blocks_without_credentials(auth_on):
+    sid, rid = "f" * 16, "f" * 12
+    _fake_source(sid)
+    _fake_run(sid, rid)
+    c = TestClient(srv.app)   # isolated cookie jar (no repvis_token yet)
+    try:
+        # every protected route (API, source video, run PCA, run POST) is 401
+        assert c.get("/api/workspace").status_code == 401
+        assert c.get("/api/sources").status_code == 401
+        assert c.get(f"/api/sources/{sid}/video").status_code == 401
+        assert c.get(f"/api/runs/{rid}/pca").status_code == 401
+        assert c.post("/api/runs", json={"source_ids": [sid], "model": "dinov2-base"}).status_code == 401
+        # the login page + auth-probe stay reachable so the UI can bootstrap
+        assert c.get("/").status_code == 200
+        assert c.get("/api/auth").json() == {"required": True}
+
+        # a valid Authorization: Bearer header authenticates
+        bearer = {"Authorization": f"Bearer {TOKEN}"}
+        assert c.get("/api/workspace", headers=bearer).status_code == 200
+        assert c.get(f"/api/sources/{sid}/video", headers=bearer).status_code == 200
+        assert c.get(f"/api/runs/{rid}/pca", headers=bearer).status_code == 200
+        # so does the X-Repvis-Token header
+        assert c.get("/api/sources", headers={"X-Repvis-Token": TOKEN}).status_code == 200
+        # a wrong token is still rejected
+        assert c.get("/api/sources", headers={"X-Repvis-Token": "nope"}).status_code == 401
+        assert c.get("/api/sources", headers={"Authorization": "Bearer nope"}).status_code == 401
+    finally:
+        _cleanup(sid, rid)
+
+
+def test_login_cookie_flow(auth_on):
+    sid, rid = "f" * 16, "f" * 12
+    _fake_source(sid)
+    _fake_run(sid, rid)
+    c = TestClient(srv.app)
+    try:
+        # wrong token -> 401, no cookie
+        assert c.post("/api/login", json={"token": "wrong"}).status_code == 401
+        assert "repvis_token" not in c.cookies
+        # correct token -> 200 and an httpOnly, samesite=strict, path=/ cookie
+        r = c.post("/api/login", json={"token": TOKEN})
+        assert r.status_code == 200 and r.json()["ok"] is True
+        sc = r.headers["set-cookie"].lower()
+        assert "repvis_token=" in sc and "httponly" in sc and "samesite=strict" in sc and "path=/" in sc
+        # the client now carries the cookie -> media + API authenticate automatically
+        assert "repvis_token" in c.cookies
+        assert c.get("/api/workspace").status_code == 200
+        assert c.get(f"/api/sources/{sid}/video").status_code == 200
+        assert c.get(f"/api/runs/{rid}/pca").status_code == 200
+    finally:
+        _cleanup(sid, rid)
+
+
+def test_auth_disabled_is_open():
+    prev = srv.AUTH_TOKEN
+    srv.AUTH_TOKEN = None            # disabled (the default for the whole suite)
+    try:
+        c = TestClient(srv.app)
+        assert c.get("/api/sources").status_code == 200
+        assert c.get("/api/auth").json() == {"required": False}
+        assert c.post("/api/login", json={"token": "anything"}).status_code == 200   # no-op
+    finally:
+        srv.AUTH_TOKEN = prev

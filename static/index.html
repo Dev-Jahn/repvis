@@ -4,7 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>repvis · dense feature PCA</title>
-<link rel="stylesheet" href="/static/style.css" />
+<!-- style.css + app.js are injected by the bootstrap below, after the access
+     token (if the server requires one) has been exchanged for the cookie. -->
 </head>
 <body>
 <div class="bg"></div>
@@ -95,6 +96,42 @@
 <!-- per-cell PC→RGB swizzle filters live here -->
 <svg id="filters" width="0" height="0" aria-hidden="true"><defs></defs></svg>
 
-<script src="/static/app.js"></script>
+<script>
+// Access-control bootstrap. The HTML shell is public; the styles, app code and
+// all content (/static/*, /api/*, videos, SSE) are gated by the server when it
+// has a token. Obtain the token (URL #t=… or a prompt), POST it to /api/login to
+// set the httpOnly cookie, then load the app — which authenticates via the cookie.
+(async () => {
+  function loadApp() {
+    const l = document.createElement("link");
+    l.rel = "stylesheet"; l.href = "/static/style.css";
+    document.head.appendChild(l);
+    const s = document.createElement("script");
+    s.src = "/static/app.js";
+    document.body.appendChild(s);
+  }
+  let required = false;
+  try { required = (await (await fetch("/api/auth")).json()).required; }
+  catch { loadApp(); return; }                 // server unreachable: let app.js report it
+  if (!required) { loadApp(); return; }         // auth disabled: no login needed
+
+  let token = null;
+  const m = location.hash.match(/(?:^#|&)t=([^&]+)/);
+  if (m) {                                      // token passed in the URL fragment
+    token = decodeURIComponent(m[1]);
+    history.replaceState(null, "", location.pathname + location.search);  // don't leave it in the URL
+  }
+  for (;;) {
+    if (!token) token = prompt("Enter the repvis access token:");
+    if (!token) return;                         // cancelled: leave the shell empty
+    const r = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (r.ok) { loadApp(); return; }
+    token = null;                               // wrong token: re-prompt
+  }
+})();
+</script>
 </body>
 </html>

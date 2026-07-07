@@ -21,6 +21,11 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 if str(VENDOR_SRC) not in sys.path:
     sys.path.insert(0, str(VENDOR_SRC))
 
+# Shared-token access control. When REPVIS_TOKEN is set (non-empty) every HTTP
+# request must present it (Authorization: Bearer / X-Repvis-Token / repvis_token
+# cookie); when unset/empty the server runs open (server.py prints a warning).
+AUTH_TOKEN = os.environ.get("REPVIS_TOKEN") or None
+
 # ---- global inference perf knobs (Blackwell) ----
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
