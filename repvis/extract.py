@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel
 
+from . import modelload
 from .config import COMPILE, DEVICES, ModelSpec
 
 
@@ -120,7 +121,6 @@ class _Manager:
     def __init__(self):
         self._cache: dict[tuple[str, str], _Extractor] = {}
         self._lock = threading.Lock()        # guards _cache
-        self._load_lock = threading.Lock()   # serializes construction (see get)
 
     def get(self, spec: ModelSpec, device: str) -> _Extractor:
         key = (spec.key, device)
@@ -131,8 +131,9 @@ class _Manager:
         # `from_pretrained(dtype=...)` is NOT thread-safe: it flips torch's global
         # default dtype during construction, so two models loading concurrently
         # race and one comes out fp32 (-> "mat1 and mat2 must have the same dtype"
-        # mid-forward). Serialize all construction; loads are one-time and cached.
-        with self._load_lock:
+        # mid-forward). Serialize all construction through the shared cross-family
+        # lock (extractor + SAM); loads are one-time and cached.
+        with modelload.LOAD_LOCK:
             with self._lock:
                 ext = self._cache.get(key)
             if ext is None:

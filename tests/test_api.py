@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 
+import numpy as np
 import pytest
 
 # Redirect sources/ + runs/ away from the repo before repvis.config is imported.
@@ -18,6 +19,7 @@ os.environ.setdefault("REPVIS_DATA_DIR", tempfile.mkdtemp(prefix="repvis-test-")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import repvis.server as srv  # noqa: E402
+from repvis import pipeline as pl  # noqa: E402
 from repvis.config import RUNS_DIR  # noqa: E402
 
 client = TestClient(srv.app)
@@ -102,7 +104,7 @@ def _run_and_wait(source_ids, model="dinov2-base", timeout=300):
 
 
 @GPU
-def test_full_joint_run_and_persistence(clips):
+def test_full_joint_run_and_persistence(clips, monkeypatch):
     sa, sb = _upload(clips[0]), _upload(clips[1])
     body = _run_and_wait([sa, sb])
     rids = [x["run_id"] for x in body["runs"]]
@@ -119,18 +121,61 @@ def test_full_joint_run_and_persistence(clips):
     ws = client.get("/api/workspace").json()
     assert set(rids) <= {r["run_id"] for r in ws["runs"]}
 
-    # SAM2 foreground: seg meta + re-segment from a point + auto reset + refit
+    # SAM2 foreground: seg meta, mask sanity, deterministic re-decode, re-seg from
+    # a 4-tuple point, point validation, SAM-failure (no clobber), auto reset + refit
     r0 = rids[0]
     meta = json.loads((RUNS_DIR / r0 / "meta.json").read_text())
     assert all(k in meta for k in ("grid", "frames", "fps", "frame_indices", "seg"))
     assert len(meta["frame_indices"]) == meta["frames"]
-    seg = client.post(f"/api/runs/{r0}/segment", json={"points": [[96, 54, 1]]})
+
+    # the initial auto-seg produced a usable, *partial* foreground mask
+    res = meta["result"]
+    m0 = pl._load_masks(RUNS_DIR / r0, meta["frames"], res["height"], res["width"])
+    assert 0.0 < float(m0.float().mean()) < 1.0
+    assert meta["seg"]["available"] is True
+
+    # frame_indices re-decode is deterministic (masks align 1:1 with feats/video)
+    sp = pl._source_path(meta["source_id"])
+    f1 = pl._decode_source_frames(sp, meta["frame_indices"])
+    f2 = pl._decode_source_frames(sp, meta["frame_indices"])
+    assert len(f1) == len(f2) == meta["frames"]
+    assert all(np.array_equal(a, b) for a, b in zip(f1, f2))
+
+    # re-segment from a 4-tuple point [x, y, label, frame]
+    seg = client.post(f"/api/runs/{r0}/segment", json={"points": [[96, 54, 1, 0]]})
     assert seg.status_code == 200 and seg.json()["ok"]
+
+    # point validation — 400 on malformed shape, 422 on out-of-run bounds
+    def _seg(pts):
+        return client.post(f"/api/runs/{r0}/segment", json={"points": pts}).status_code
+    # NaN can't ride httpx's JSON encoder (allow_nan=False) — send a raw body; the
+    # server's stdlib json.loads accepts the literal, then math.isfinite rejects it.
+    nan_r = client.post(f"/api/runs/{r0}/segment", content='{"points": [[NaN, 0, 1, 0]]}',
+                        headers={"Content-Type": "application/json"})
+    assert nan_r.status_code == 400                      # non-finite coordinate
+    assert _seg([[10, 10, 2, 0]]) == 400                 # label not in {0, 1}
+    assert _seg([[1, 2]]) == 400                         # wrong arity
+    assert client.post(f"/api/runs/{r0}/segment", json={"points": "x"}).status_code == 400
+    assert _seg([[1e12, 0, 1, 0]]) == 422                # x outside frame bounds
+    assert _seg([[10, 10, 1, 999]]) == 422               # frame index out of range
+
+    # a SAM failure on a refine must NOT clobber the existing artifacts (5xx, bytes intact)
+    before_masks = (RUNS_DIR / r0 / "masks.u1").read_bytes()
+    before_pca = (RUNS_DIR / r0 / "pca.mp4").read_bytes()
+
+    def _boom(*a, **k):
+        raise RuntimeError("sam down")
+
+    monkeypatch.setattr("repvis.pipeline.sam.segment", _boom)
+    fail = client.post(f"/api/runs/{r0}/segment", json={"points": [[96, 54, 1, 0]]})
+    assert 500 <= fail.status_code < 600
+    assert (RUNS_DIR / r0 / "masks.u1").read_bytes() == before_masks
+    assert (RUNS_DIR / r0 / "pca.mp4").read_bytes() == before_pca
+    monkeypatch.undo()
+
     assert client.post(f"/api/runs/{r0}/segment", json={"points": []}).status_code == 200   # auto reset
     assert client.post(f"/api/runs/{r0}/refit", json={}).status_code == 200                 # no threshold
     assert client.get(f"/api/runs/{r0}/pca").status_code == 200
-    assert client.post(f"/api/runs/{r0}/segment", json={"points": [[1, 2]]}).status_code == 400
-    assert client.post(f"/api/runs/{r0}/segment", json={"points": "x"}).status_code == 400
 
     # a re-run of the same (source, model) supersedes the old result on disk
     old = next(x["run_id"] for x in body["runs"] if x["source_id"] == sa)

@@ -40,9 +40,48 @@ def _fit(x: torch.Tensor, k: int, fit_max: int):
 
 
 @torch.inference_mode()
+def _fit_weighted(x: torch.Tensor, w: torch.Tensor, k: int):
+    """Weighted top-k principal components (k, D) and weighted mean (D,).
+
+    `w` are per-token weights (>= 0, aligned to `x`). Weighted mean
+    `mu = sum(w_i x_i) / sum(w_i)`, then SVD on `sqrt(w)*(x-mu)` so each token
+    contributes to the basis in proportion to its weight."""
+    wsum = w.sum().clamp_min(1e-12)
+    mean = (w[:, None] * x).sum(0) / wsum
+    xc = w.sqrt()[:, None] * (x - mean)
+    _, _, vh = torch.linalg.svd(xc, full_matrices=False)
+    comps = vh[:k].clone()
+    for i in range(k):  # deterministic sign -> stable colors run-to-run
+        j = torch.argmax(comps[i].abs())
+        if comps[i, j] < 0:
+            comps[i] = -comps[i]
+    return comps, mean
+
+
+@torch.inference_mode()
 def _quantile(x: torch.Tensor, qs) -> torch.Tensor:
     x = _subsample(x, 200_000)
     return torch.quantile(x, torch.tensor(qs, device=x.device, dtype=x.dtype))
+
+
+@torch.inference_mode()
+def _weighted_quantile(x: torch.Tensor, w: torch.Tensor, qs) -> torch.Tensor:
+    """Weighted quantiles of 1-D `x` (non-negative weights `w`, aligned to `x`).
+
+    `qs` are fractions in [0, 1]. Linear interpolation on the weighted CDF using
+    the midpoint plotting position, which matches `torch.quantile` when weights
+    are equal."""
+    order = torch.argsort(x)
+    xs, ws = x[order], w[order]
+    cw = torch.cumsum(ws, 0)
+    cdf = (cw - 0.5 * ws) / cw[-1].clamp_min(1e-12)
+    q = torch.as_tensor(qs, device=x.device, dtype=x.dtype)
+    hi = torch.searchsorted(cdf, q).clamp(max=xs.numel() - 1)
+    lo = (hi - 1).clamp(min=0)
+    t = ((q - cdf[lo]) / (cdf[hi] - cdf[lo]).clamp_min(1e-12)).clamp(0.0, 1.0)
+    out = xs[lo] + t * (xs[hi] - xs[lo])
+    out = torch.where(q <= cdf[0], xs[0], out)
+    return torch.where(q >= cdf[-1], xs[-1], out)
 
 
 @dataclass
@@ -91,19 +130,30 @@ def project_chunk(feats: torch.Tensor, st: PCAState) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def refit_display(fg_tokens: torch.Tensor, st: PCAState,
+def refit_display(fg_tokens: torch.Tensor, st: PCAState, *,
+                  weights: torch.Tensor | None = None,
                   percentiles=(2.0, 98.0)) -> PCAState:
     """Re-fit the display basis (mean/comps/lo/hi) on `fg_tokens` — the per-cell
-    'Refit' that maximizes color contrast within the current foreground."""
+    'Refit' that maximizes color contrast within the current foreground.
+
+    With per-token `weights` in [0, 1] (e.g. the per-grid-token foreground
+    fraction) the fit is a WEIGHTED PCA: weighted mean, SVD on `sqrt(w)*(x-mean)`,
+    and weighted projected quantiles for lo/hi. Thin structures (small but nonzero
+    weight) then survive the refit proportionally instead of being hard-gated out.
+    No weights -> the original unweighted behavior."""
     x = fg_tokens.float()
     if st.l2norm:
         x = F.normalize(x, dim=1)
-    comps, mean = _fit(x, 3, x.shape[0])
+    if weights is None:
+        comps, mean = _fit(x, 3, x.shape[0])
+    else:
+        weights = weights.to(device=x.device, dtype=x.dtype).clamp_min(0)
+        comps, mean = _fit_weighted(x, weights, 3)
     z = (x - mean) @ comps.T
     p = [percentiles[0] / 100.0, percentiles[1] / 100.0]
     lo = torch.empty(3, device=x.device)
     hi = torch.empty(3, device=x.device)
     for c in range(3):
-        q = _quantile(z[:, c], p)
+        q = _quantile(z[:, c], p) if weights is None else _weighted_quantile(z[:, c], weights, p)
         lo[c], hi[c] = q[0], q[1]
     return replace(st, mean=mean, comps=comps, lo=lo, hi=hi)

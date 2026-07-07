@@ -292,17 +292,17 @@ def _decode_source_frames(path, indices) -> list[np.ndarray]:
     return [arr[i] for i in range(arr.shape[0])]
 
 
-def _auto_seed(grid0: torch.Tensor, width: int, height: int) -> list[tuple[float, float, int]]:
+def _auto_seed(grid0: torch.Tensor, width: int, height: int) -> list[tuple[float, float, int, int]]:
     """DINO-saliency auto seed: from a frame-0 grid feature (gh, gw, D), pick the
     patch whose feature is farthest (L2) from the patch mean and map its centre to
-    a source pixel. Returns a single positive point [(x, y, 1)]."""
+    a source pixel. Returns a single positive point [(x, y, 1, 0)] on seed frame 0."""
     gh, gw, D = grid0.shape
     x = grid0.reshape(-1, D).float()
     sal = (x - x.mean(0)).norm(dim=1)          # (gh*gw,)
     row, col = divmod(int(sal.argmax()), gw)
     px = (col + 0.5) / gw * float(width)
     py = (row + 0.5) / gh * float(height)
-    return [(px, py, 1)]
+    return [(px, py, 1, 0)]
 
 
 def _resize_masks(m: torch.Tensor, oh: int, ow: int) -> torch.Tensor:
@@ -312,21 +312,33 @@ def _resize_masks(m: torch.Tensor, oh: int, ow: int) -> torch.Tensor:
     return F.interpolate(m.float()[:, None], size=(oh, ow), mode="nearest")[:, 0] > 0.5
 
 
-def _segment(frames_np: list, points: list, dev: str, oh: int, ow: int,
-             seed_frame: int = 0) -> tuple[torch.Tensor, dict]:
-    """Run SAM2 from `points` over `frames_np`; return ((T, oh, ow) bool CPU mask,
-    seg dict). If segmentation fails/empties, fall back to an all-foreground mask
-    with seg.available False so the video still renders."""
+def _seg_meta(points: list, *, available: bool, error, empty: bool) -> dict:
+    """Build the C2 seg meta object. `points` are 4-tuples (x, y, label, frame)."""
+    return {"available": bool(available), "error": error, "empty": bool(empty),
+            "seed_frame": 0,
+            "points": [[float(x), float(y), int(lab), int(fr)] for (x, y, lab, fr) in points]}
+
+
+def _run_sam(frames_np: list, points: list, dev: str, oh: int, ow: int) -> tuple[torch.Tensor, bool]:
+    """Run SAM2 from per-frame `points` over `frames_np` and resize to (oh, ow).
+    RAISES on SAM failure (callers decide whether to swallow). Returns
+    ((T, oh, ow) bool CPU mask, empty) where empty is True iff no foreground."""
+    raw = sam.segment(frames_np, points, dev)          # (T, H, W) bool
+    masks = _resize_masks(raw, oh, ow)
+    return masks, not bool(masks.any())
+
+
+def _segment(frames_np: list, points: list, dev: str, oh: int, ow: int) -> tuple[torch.Tensor, dict]:
+    """INITIAL-run segmentation: run SAM2 and build the C2 seg meta. On a SAM hard
+    error, fall back to an all-foreground mask (available=False, error=<msg>) so the
+    video still renders; an empty result is available=True, empty=True."""
     T = len(frames_np)
     try:
-        raw = sam.segment(frames_np, points, dev, seed_frame=seed_frame)  # (T,H,W) bool
-        masks = _resize_masks(raw, oh, ow)
-        available = bool(masks.any())
-    except Exception:  # noqa: BLE001
+        masks, empty = _run_sam(frames_np, points, dev, oh, ow)
+        seg = _seg_meta(points, available=True, error=None, empty=empty)
+    except Exception as e:  # noqa: BLE001
         masks = torch.ones(T, oh, ow, dtype=torch.bool)
-        available = False
-    seg = {"available": available, "seed_frame": int(seed_frame),
-           "points": [[float(x), float(y), int(lab)] for (x, y, lab) in points]}
+        seg = _seg_meta(points, available=False, error=str(e), empty=False)
     return masks, seg
 
 
@@ -671,21 +683,35 @@ def _replace_video(fn, tmp: Path, dst: Path):
 def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
     """Re-segment a run from client point prompts and re-bake pca.mp4.
 
-    `points`: list of [x, y, label] (label 1 = foreground/+, 0 = background/-) in
-    SOURCE pixel coords. EMPTY -> recompute the DINO-saliency auto-seed from the
-    persisted frame-0 grid features. The source's exact sampled frame_indices are
-    re-decoded so the SAM masks align 1:1 with feats.f16 / the video. Persists
-    masks.u1 + meta['seg'], atomically replaces pca.mp4, returns meta['seg'].
+    `points`: list of [x, y, label, frame] (label 1 = foreground/+, 0 = background/-)
+    in SOURCE pixel coords, `frame` the sampled-frame index the click was placed on.
+    EMPTY -> recompute the DINO-saliency auto-seed from the persisted frame-0 grid
+    features. The source's exact sampled frame_indices are re-decoded so the SAM
+    masks align 1:1 with feats.f16 / the video. On a SAM failure this RAISES and
+    leaves pca.mp4 / masks.u1 / meta['seg'] untouched (never a partial write).
+    Out-of-bounds / non-finite points raise ValueError. Persists masks.u1 +
+    meta['seg'], atomically replaces pca.mp4, returns meta['seg'].
     """
     run_dir = Path(run_dir)
     meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
 
     frames_np = _decode_source_frames(_source_path(meta["source_id"]), meta["frame_indices"])
     H, W = frames_np[0].shape[:2]
-    pts = [(float(p[0]), float(p[1]), int(p[2])) for p in points]
+    pts = []
+    for p in points:   # bounds-check client points against this run's W/H/T
+        x, y, lab, fr = float(p[0]), float(p[1]), int(p[2]), int(p[3])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"non-finite point coord ({x}, {y})")
+        if not (0.0 <= x < W and 0.0 <= y < H):
+            raise ValueError(f"point ({x}, {y}) out of frame bounds {W}x{H}")
+        if not (0 <= fr < T):
+            raise ValueError(f"point frame {fr} out of range [0, {T})")
+        pts.append((x, y, lab, fr))
     if not pts:   # reset -> recompute the auto-seed from persisted feats frame-0 grid
         pts = _auto_seed(feats[0], W, H)
-    masks, seg = _segment(frames_np, pts, dev, oh, ow)
+    # SAM failure propagates here (no fallback) so we never clobber the existing run.
+    masks, empty = _run_sam(frames_np, pts, dev, oh, ow)
+    seg = _seg_meta(pts, available=True, error=None, empty=empty)
     del frames_np
 
     chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
@@ -710,14 +736,20 @@ def refit_and_render(run_dir: Path, emit=None) -> dict:
     meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
     masks = _load_masks(run_dir, T, oh, ow)
 
-    # downsample the pixel masks to the feature grid, gather foreground tokens
-    grid_mask = F.adaptive_avg_pool2d(masks.float().unsqueeze(1), (gh, gw)).squeeze(1) > 0.5
-    fg_tokens = feats.reshape(-1, D)[grid_mask.reshape(-1)]
+    # downsample the pixel masks to the feature grid -> per-token fg FRACTION in
+    # [0,1], used as soft weights (no hard >0.5 gate) so thin structures survive
+    # proportionally. Keep every token with any foreground; drop only w == 0.
+    grid_frac = F.adaptive_avg_pool2d(masks.float().unsqueeze(1), (gh, gw)).squeeze(1)
+    w = grid_frac.reshape(-1)                       # (T*gh*gw,)
+    keep = w > 0
+    fg_tokens = feats.reshape(-1, D)[keep]
+    fg_w = w[keep]
     if fg_tokens.shape[0] < 16:
         raise ValueError("mask leaves too little foreground to refit")
     if fg_tokens.shape[0] > _FIT_MAX:
-        fg_tokens = fg_tokens[torch.randperm(fg_tokens.shape[0])[:_FIT_MAX]]
-    new_state = refit_display(fg_tokens.to(dev), state.to(dev))
+        sel = torch.randperm(fg_tokens.shape[0])[:_FIT_MAX]
+        fg_tokens, fg_w = fg_tokens[sel], fg_w[sel]
+    new_state = refit_display(fg_tokens.to(dev), state.to(dev), weights=fg_w.to(dev))
 
     chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
     del feats

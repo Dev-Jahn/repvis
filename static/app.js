@@ -458,9 +458,11 @@ function fillPcaCell(runId, result) {
 
   // SAM foreground segmentation: click layer + point markers over the (baked) video.
   // seg source: fresh run -> result.seg, reload/re-attach -> run entry's seg in runMeta.
+  // Show the click layer + controls whenever a run rendered (seg exists), not only when
+  // the auto-seg succeeded — a failed/empty auto-seg is recovered by clicking a point.
   const seg = (result && result.seg) || meta.seg || null;
   entry.seg = seg;
-  if (seg && seg.available) {
+  if (seg) {
     entry.points = (seg.points || []).map((p) => p.slice());
     startSeg(entry);                            // click layer + markers over the video
     entry.cell.appendChild(buildSegCtl(entry)); // ↺ reset + Refit
@@ -608,12 +610,21 @@ function drawMarkers(entry) {
   }
 }
 
+// Which seg frame a click lands on: DURATION ratio × seg.frames (NOT fps — an NVENC
+// sub-1fps encode can round, so seg.fps may disagree with the real frame count).
+function frameOfClick(entry) {
+  const v = entry.video, n = (entry.seg && entry.seg.frames) || 1;
+  const dur = v.duration;
+  const f = (isFinite(dur) && dur > 0) ? Math.floor((v.currentTime / dur) * n) : 0;
+  return Math.max(0, Math.min(n - 1, f));
+}
+
 function onSegClick(entry, e) {
   if (entry.segBusy) return;
   const pt = clickToSource(entry.video, e.clientX, e.clientY);
   if (!pt) return;
   e.preventDefault();
-  entry.points.push([pt[0], pt[1], e.altKey ? 0 : 1]);   // Alt/Option -> negative
+  entry.points.push([pt[0], pt[1], e.altKey ? 0 : 1, frameOfClick(entry)]);   // Alt/Option -> negative
   drawMarkers(entry);
   submitSeg(entry);
 }
@@ -722,7 +733,16 @@ function buildSegCtl(entry) {
 
   const hint = document.createElement("span");
   hint.className = "seghint";
-  hint.textContent = "click +  ·  alt −";
+  const seg = entry.seg || {};
+  if (seg.error) {
+    hint.textContent = "segmentation failed — click to add a point";
+    hint.style.color = "var(--danger)";
+  } else if (seg.empty) {
+    hint.textContent = "no foreground — click the subject";
+    hint.style.color = "var(--danger)";
+  } else {
+    hint.textContent = "click +  ·  alt −";
+  }
   bar.appendChild(hint);
 
   const reset = document.createElement("button");

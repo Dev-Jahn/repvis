@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -33,6 +34,9 @@ app = FastAPI(title="repvis")
 SOURCES: dict[str, dict] = {}   # source_id -> {id, name, ext, size}
 GROUPS: dict[str, dict] = {}    # group_id  -> live group/progress state
 LOCK = threading.Lock()
+# rids of in-flight /segment|/refit mutations (guarded by LOCK). Deletes and the
+# _persist_run supersede skip/refuse these so we never clobber a run mid-mutation.
+ACTIVE_RUN_MUTATIONS: set[str] = set()
 # Serialize GPU work so a single group gets the whole machine (and we never OOM-race).
 EXEC = ThreadPoolExecutor(max_workers=1)
 
@@ -92,18 +96,22 @@ def _seg_client(meta: dict | None) -> dict:
 
 def _parse_points(payload: dict) -> list:
     """Validate a segment request body: `points` must be a list (possibly empty)
-    of [number, number, 0|1]. Returns the point list or raises 400."""
+    of [x, y, label, frame] with x,y finite numbers, label in {0,1} and frame an
+    int >= 0 (bools rejected). Run-specific bounds (x<W, y<H, frame<T) are enforced
+    in the pipeline (ValueError -> 422). Returns the point list or raises 400."""
     pts = payload.get("points")
     if not isinstance(pts, list):
-        raise HTTPException(400, "points (list of [x,y,label]) required")
+        raise HTTPException(400, "points (list of [x,y,label,frame]) required")
     out = []
     for p in pts:
-        if (not isinstance(p, (list, tuple)) or len(p) != 3
+        if (not isinstance(p, (list, tuple)) or len(p) != 4
                 or any(isinstance(v, bool) for v in p)
                 or not all(isinstance(v, (int, float)) for v in p[:2])
-                or p[2] not in (0, 1)):
-            raise HTTPException(400, "each point must be [number, number, 0|1]")
-        out.append([float(p[0]), float(p[1]), int(p[2])])
+                or not all(math.isfinite(v) for v in p[:2])
+                or p[2] not in (0, 1)
+                or not isinstance(p[3], int) or p[3] < 0):
+            raise HTTPException(400, "each point must be [number, number, 0|1, frame>=0]")
+        out.append([float(p[0]), float(p[1]), int(p[2]), int(p[3])])
     return out
 
 
@@ -141,8 +149,10 @@ def _persist_run(meta: dict):
     if rmeta:  # lift grid/feat_dim/frames/fps/frame_indices/seg to meta top-level
         meta.update(rmeta)
     (RUNS_DIR / rid / "meta.json").write_text(json.dumps(meta))
+    with LOCK:
+        protected = set(ACTIVE_RUN_MUTATIONS)
     for d in RUNS_DIR.glob("*"):
-        if d.name == rid or not d.is_dir():
+        if d.name == rid or not d.is_dir() or d.name in protected:
             continue
         m = _run_record(d)
         if m and m.get("source_id") == sid and m.get("model") == model:
@@ -285,18 +295,23 @@ def delete_source(sid: str):
     """Remove a source and every result derived from it."""
     if not _safe_id(sid):
         raise HTTPException(404)
+    derived = []
+    for d in RUNS_DIR.glob("*"):
+        if d.is_dir():
+            m = _run_record(d)
+            if m and m.get("source_id") == sid:
+                derived.append(d)
     with LOCK:
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
         if sid not in SOURCES:
             raise HTTPException(404)
+        if any(d.name in ACTIVE_RUN_MUTATIONS for d in derived):
+            raise HTTPException(409, "a derived run is being segmented/refit")
         SOURCES.pop(sid)
     shutil.rmtree(SOURCES_DIR / sid, ignore_errors=True)
-    for d in RUNS_DIR.glob("*"):
-        if d.is_dir():
-            m = _run_record(d)
-            if m and m.get("source_id") == sid:
-                shutil.rmtree(d, ignore_errors=True)
+    for d in derived:
+        shutil.rmtree(d, ignore_errors=True)
     return {"ok": True}
 
 
@@ -447,16 +462,21 @@ def run_segment(rid: str, payload: dict = Body(...)):
     with LOCK:
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
+        ACTIVE_RUN_MUTATIONS.add(rid)
     try:
         seg = EXEC.submit(segment_and_render, rd, points).result()
     except HTTPException:
         raise
     except FileNotFoundError:
         raise HTTPException(404)
+    except ValueError as e:   # out-of-bounds/non-finite points (run dims known in pipeline)
+        raise HTTPException(422, str(e))
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         raise HTTPException(500, str(e))
     finally:
+        with LOCK:
+            ACTIVE_RUN_MUTATIONS.discard(rid)
         try:
             flush_vram()
         except Exception:  # noqa: BLE001
@@ -476,16 +496,21 @@ def run_refit(rid: str):
     with LOCK:
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
+        ACTIVE_RUN_MUTATIONS.add(rid)
     try:
         seg = EXEC.submit(refit_and_render, rd).result()
     except HTTPException:
         raise
     except FileNotFoundError:
         raise HTTPException(404)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         raise HTTPException(500, str(e))
     finally:
+        with LOCK:
+            ACTIVE_RUN_MUTATIONS.discard(rid)
         try:
             flush_vram()
         except Exception:  # noqa: BLE001
@@ -495,12 +520,12 @@ def run_refit(rid: str):
 
 @app.delete("/api/runs")
 def delete_runs():
-    """Clear all completed results (in-flight groups are left untouched)."""
+    """Clear all completed results (in-flight groups and mutating runs untouched)."""
     with LOCK:
-        active_ids = _active_run_ids()
+        skip = _active_run_ids() | ACTIVE_RUN_MUTATIONS
     removed = 0
     for d in RUNS_DIR.glob("*"):
-        if d.is_dir() and d.name not in active_ids:
+        if d.is_dir() and d.name not in skip:
             shutil.rmtree(d, ignore_errors=True)
             removed += 1
     return {"ok": True, "removed": removed}
