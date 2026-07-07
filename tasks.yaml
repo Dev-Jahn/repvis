@@ -75,3 +75,37 @@ tasks:
     title: "Persist the Sam2VideoInferenceSession / vision features per run so +/- click re-segmentation skips recomputation and cuts click latency"
     status: "pending"
     origin: "round 2026-07-07"
+  - id: fix/segment-click-frame-idx
+    title: "Segment refine clicks always seed frame 0: client sends [x,y,label] with no frame, sam.segment uses seed_frame=0 -> a click on a later frame maps coords to frame 0 and corrupts SAM propagation. Thread frame idx (point schema + per-frame prompting)"
+    status: "pending"
+    severity: "blocker"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: fix/sam-failure-silent-fallback
+    title: "SAM2 exception/empty mask is hidden as all-foreground + available=False, which also strips the client's click controls (no recovery) and lets refine failures overwrite good masks; distinguish error vs empty, keep controls, don't clobber on refine failure, add failure-mode tests (monkeypatch + mask-ratio asserts)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: fix/shared-model-load-lock
+    title: "extractor and SAM2 from_pretrained race on torch global default dtype: their _load_lock objects are separate and run_group warms both concurrently (pipeline 534-535); share ONE global model-construction lock or sequence extractor->SAM warm"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: fix/segment-point-validation
+    title: "_parse_points accepts NaN/Infinity/out-of-bounds coords (shape-only check); validate finite + within the run's WxH (+ frame idx) and reject 4xx before reaching SAM2"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: fix/run-mutation-mutex
+    title: "segment/refit re-render is not excluded from DELETE /api/runs, DELETE /api/sources, or (source,model) supersede — a concurrent delete can rmtree run_dir/feats/masks/source mid-render; track in-progress run mutations and gate destructive ops"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: spike/frame-alignment-check
+    title: "Verify 'frame alignment is exact': phase-1 GPU-decode vs SAM CPU re-decode both use seek_mode=approximate and tests only check index-length; add checksum/hash verification + open-GOP/VFR fixtures, or reuse one decode path"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-07-sam2-foreground"
+  - id: decision/refit-mask-grid-threshold
+    title: "Is refit_and_render's adaptive_avg_pool2d(mask,grid)>0.5 (drops <50%-fg patches, excluding thin arms/tools/wheels from the color refit) intended, or should it use a lower threshold / soft weighting to cover thin structures?"
+    status: "pending"
+    origin: "review-2026-07-07-sam2-foreground"
