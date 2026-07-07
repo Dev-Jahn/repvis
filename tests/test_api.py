@@ -172,7 +172,7 @@ def test_full_joint_run_and_persistence(clips, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("sam down")
 
-    monkeypatch.setattr("repvis.pipeline.sam.segment", _boom)
+    monkeypatch.setattr("repvis.pipeline.sam.segment_session", _boom)  # re-seg path
     fail = client.post(f"/api/runs/{r0}/segment", json={"points": [[96, 54, 1, 0]]})
     assert 500 <= fail.status_code < 600
     assert (RUNS_DIR / r0 / "masks.u1").read_bytes() == before_masks

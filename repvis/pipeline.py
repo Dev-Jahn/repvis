@@ -30,6 +30,7 @@ import math
 import os
 import queue
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,62 @@ from .video_io import GpuEncoder, GpuVideoSource, compute_indices, probe_video
 
 _FIT_MAX = 300_000   # max tokens used to fit the PCA basis (pooled across sources)
 _MIN_SEG = 192       # don't split a source into segments smaller than this
+
+
+# ----------------------------------------------------- SAM2 per-run session cache
+# Each +/- click re-segments a run. Without a cache that re-decodes the source
+# frames AND re-runs the SAM2 vision encoder (~33 ms/frame) every time. A cached
+# Sam2VideoInferenceSession persists the decoded frames + full vision-feature cache
+# (both CPU-resident, so an idle entry costs host RAM, not VRAM), so a subsequent
+# click only re-runs prompt conditioning + propagation. Bounded to the few most
+# recent runs (LRU); each cached run holds all its frames' features in host RAM, so
+# keep this small. Correctness rests on explicit invalidation: an entry is dropped
+# when its run is deleted / superseded by a re-run (server) or refit (below).
+_MAX_CACHED_RUNS = 2
+
+
+class _SegCache:
+    """LRU of run_id -> (Sam2VideoInferenceSession, sig). `sig` (source_id, T) is a
+    cheap guard: a hit whose signature no longer matches the run on disk is ignored
+    rather than reused, so a mismatched/stale session can never yield wrong masks.
+
+    Touched by the single EXEC worker (populate, in segment_and_render) and by
+    request threads (drop, on delete/refit/supersede); its own lock makes those
+    concurrent accesses safe independently of the server's global LOCK.
+    """
+
+    def __init__(self, maxsize: int):
+        self._maxsize = maxsize
+        self._d: OrderedDict[str, tuple] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, run_id: str, sig):
+        with self._lock:
+            ent = self._d.get(run_id)
+            if ent is None or ent[1] != sig:
+                return None
+            self._d.move_to_end(run_id)
+            return ent[0]
+
+    def put(self, run_id: str, sess, sig):
+        with self._lock:
+            self._d[run_id] = (sess, sig)
+            self._d.move_to_end(run_id)
+            while len(self._d) > self._maxsize:
+                self._d.popitem(last=False)
+
+    def drop(self, run_id: str):
+        with self._lock:
+            self._d.pop(run_id, None)
+
+
+_SEG_CACHE = _SegCache(_MAX_CACHED_RUNS)
+
+
+def drop_seg_cache(run_id: str):
+    """Invalidate a run's cached SAM2 session (call when the run is deleted or
+    superseded). No-op if not cached. Safe to call from any thread."""
+    _SEG_CACHE.drop(run_id)
 
 
 def _even(v: int) -> int:
@@ -694,9 +751,19 @@ def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
     """
     run_dir = Path(run_dir)
     meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
+    run_id = run_dir.name
+    sig = (meta.get("source_id"), T)
 
-    frames_np = _decode_source_frames(_source_path(meta["source_id"]), meta["frame_indices"])
-    H, W = frames_np[0].shape[:2]
+    # Reuse a cached SAM2 session (decoded frames + vision features) for this run;
+    # only a cold click decodes the source frames and builds one. The session is
+    # immutable for a run_id (fixed source + frame_indices), so a hit is safe.
+    sess = _SEG_CACHE.get(run_id, sig)
+    frames_np = None
+    if sess is not None:
+        H, W = int(sess.video_height), int(sess.video_width)
+    else:
+        frames_np = _decode_source_frames(_source_path(meta["source_id"]), meta["frame_indices"])
+        H, W = frames_np[0].shape[:2]
     pts = []
     for p in points:   # bounds-check client points against this run's W/H/T
         x, y, lab, fr = float(p[0]), float(p[1]), int(p[2]), int(p[3])
@@ -709,10 +776,27 @@ def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
         pts.append((x, y, lab, fr))
     if not pts:   # reset -> recompute the auto-seed from persisted feats frame-0 grid
         pts = _auto_seed(feats[0], W, H)
+    if sess is None:
+        sess = sam.build_session(frames_np, dev)
+        del frames_np
     # SAM failure propagates here (no fallback) so we never clobber the existing run.
-    masks, empty = _run_sam(frames_np, pts, dev, oh, ow)
+    # A failed re-segment may leave the session's tracking data half-populated, so
+    # drop it — the vision cache is fine but the entry is rebuilt on the next click.
+    try:
+        raw = sam.segment_session(sess, pts, dev)          # (T, H, W) bool
+    except BaseException:
+        _SEG_CACHE.drop(run_id)
+        raise
+    masks = _resize_masks(raw, oh, ow)
+    empty = not bool(masks.any())
+    # Keep the session for the next click. Known-harmless race (flagged in GPU
+    # validation): a server-side drop (delete/supersede/refit) can land AFTER this
+    # in-flight segment already read the cache but BEFORE this put, so we may re-put a
+    # run_id that was just dropped. Harmless — a dropped run is never requested again
+    # (its dir is being removed / superseded), so the re-put entry is simply never hit
+    # and is LRU-evicted by later runs.
+    _SEG_CACHE.put(run_id, sess, sig)
     seg = _seg_meta(pts, available=True, error=None, empty=empty)
-    del frames_np
 
     chunks = [feats[i:i + STREAM_CHUNK].contiguous() for i in range(0, T, STREAM_CHUNK)]
     del feats
@@ -738,6 +822,10 @@ def refit_and_render(run_dir: Path, emit=None) -> dict:
     re-bake pca.mp4 with the SAME masks (no threshold). Overwrites state.pt and
     returns meta['seg'] unchanged. Runs on a GPU chosen via select_devices."""
     run_dir = Path(run_dir)
+    # Refit leaves the source frames/masks unchanged, so the cached SAM session
+    # stays valid; drop it anyway (conservative) — refit ends a click session and
+    # frees the host-RAM footprint, and the next click rebuilds cheaply.
+    _SEG_CACHE.drop(run_dir.name)
     meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
     masks = _load_masks(run_dir, T, oh, ow)
 

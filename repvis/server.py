@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import AUTH_TOKEN, DEVICES, RUNS_DIR, SOURCES_DIR, STATIC_DIR, REGISTRY
 from .extract import flush_vram
-from .pipeline import refit_and_render, run_group, segment_and_render
+from .pipeline import drop_seg_cache, refit_and_render, run_group, segment_and_render
 
 app = FastAPI(title="repvis")
 
@@ -157,6 +157,7 @@ def _persist_run(meta: dict):
                 continue
             m = _run_record(d)
             if m and m.get("source_id") == sid and m.get("model") == model:
+                drop_seg_cache(d.name)   # a re-run supersedes this run; its cache is stale
                 shutil.rmtree(d, ignore_errors=True)
 
 
@@ -382,6 +383,7 @@ def delete_source(sid: str):
         SOURCES.pop(sid)
         shutil.rmtree(SOURCES_DIR / sid, ignore_errors=True)
         for d in derived:
+            drop_seg_cache(d.name)
             shutil.rmtree(d, ignore_errors=True)
     return {"ok": True}
 
@@ -605,6 +607,7 @@ def delete_runs():
         removed = 0
         for d in RUNS_DIR.glob("*"):
             if d.is_dir() and d.name not in skip:
+                drop_seg_cache(d.name)
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
     return {"ok": True, "removed": removed}
