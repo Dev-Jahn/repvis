@@ -68,6 +68,12 @@ For a different CUDA build, change the `pytorch-cu130` index URL in `pyproject.t
    color channel (the 6 permutations) plus optional per-channel invert — applied
    live as a browser filter, no re-encode. **⬇** downloads the PCA video (encoded
    canonically as PC1→R PC2→G PC3→B; the swizzle is display-only).
+5. Each PCA cell has its **foreground isolated**: a lightweight **SAM2** pass segments the
+   subject (auto-seeded from feature saliency) and bakes the mask into the video (background
+   → black), pixel-accurate and temporally consistent. Click the cell to add a **foreground
+   point (+)**, **Alt/Option-click** for a **background point (−)** and it re-segments; **↺**
+   resets to the auto-seed. **Refit** re-fits the PCA colors over the current foreground so
+   within-subject color contrast stands out.
 
 The workspace is **persistent**: completed results live on disk (`runs/`, or
 `$REPVIS_DATA_DIR`) and the matrix is rebuilt on page reload — even reloading

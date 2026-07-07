@@ -135,12 +135,17 @@ Compile is opt-in via `REPVIS_COMPILE=1` and applies only to the `on` (RoPE) mod
 - **TensorRT (11.1, sm_120)** — builds and runs but only 1.02×; cuBLAS GEMM path unchanged.
 - **FP8** — GEMM 1.6–1.9× but diluted to 1.18–1.25× overall by bf16 attention; FP8 attention not pursued (fidelity risk). Left as a known forward-speed ceiling.
 - **Preset-resolution precompile** — 79–89 distinct grids in practice; presets cover <10%; dynamic-shape single-graph compile cuts throughput. Replaced by the persistent inductor cache.
-- **remove_bg alternatives:** CLS-token cosine saliency (fails on DINOv3 — CLS lives in a different subspace); temporal-mean / DCT-field debias (deletes static subjects); "foreground = minority side of PC1" (inverts on people-dominant frames); PCA R² positional-vs-semantic test (not discriminative — temporal-mean maps are always smooth); k=2 side-picking (flips with k-means init). Also the earlier **median/50% PC1 split** (fixed half-black frame) superseded by Otsu, then by the k=4 method.
+- **remove_bg alternatives** — *note: the whole feature-clustering remove_bg was replaced by SAM2 pixel segmentation (see §Rounds `2026-07-07-sam2-foreground`); these are historical cautions, not current guidance:* CLS-token cosine saliency (fails on DINOv3 — CLS lives in a different subspace); temporal-mean / DCT-field debias (deletes static subjects); "foreground = minority side of PC1" (inverts on people-dominant frames); PCA R² positional-vs-semantic test (not discriminative — temporal-mean maps are always smooth); k=2 side-picking (flips with k-means init). Also the earlier **median/50% PC1 split** (fixed half-black frame) superseded by Otsu, then by the k=4 method.
 - **HF processor for resize** — silently ignores `size=`. **String-sort version discovery** — mis-ranked torchcodec. **davevanveen V-JEPA checkpoint** — not cross-loadable into the port. **Layout-sniffing in the V-JEPA port** — fragile; replaced by the strict (B,C,T,H,W) contract.
 
 ---
 
-## Current status (as of 2026-07-05 / 06)
+## Status snapshot (2026-07-05 / 06 — superseded; current state is in §Rounds above)
+
+> This is the point-in-time snapshot from the reconstruction. Since then: `be04e13` and everything
+> through the SAM2 rework are **pushed**; feature-clustering remove_bg was **replaced by SAM2**
+> segmentation. See §Rounds (top) for the live state.
+
 
 - **Working tree clean.** `main` is **1 commit ahead of origin** — `be04e13` (remove_bg robust masking) is **committed but NOT yet pushed** (push happens only on explicit user instruction, after a leak scan of `git diff origin/main..HEAD`).
 - **Tests:** CPU pytest **5 passed / 1 skipped** (the GPU pipeline test is skipped without `REPVIS_TEST_GPU=1`); with GPU enabled the full suite passes. ruff clean.
