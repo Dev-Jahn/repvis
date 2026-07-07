@@ -288,6 +288,21 @@ def list_sources():
         return {"sources": list(SOURCES.values())}
 
 
+def _materialize_source(sid: str, tmp: Path, ext: str, name: str, size: int, rec: dict):
+    """Register a streamed upload atomically with delete_source (both take LOCK).
+    Reuse the on-disk dir only if it actually holds the video (a half-materialized
+    empty dir left by an interrupted upload is re-created); otherwise move the temp
+    file into place. Runs on a worker thread — NEVER the event loop — so acquiring the
+    blocking LOCK here can't stall SSE/async requests while a delete holds it."""
+    with LOCK:
+        d = SOURCES_DIR / sid
+        if not any(d.glob("video.*")):   # dir absent or missing its video -> (re)materialize
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp), str(d / ("video" + ext)))
+            (d / "meta.json").write_text(json.dumps({"name": name, "ext": ext, "size": size}))
+        SOURCES[sid] = rec
+
+
 @app.post("/api/sources")
 async def upload_source(file: UploadFile = File(...)):
     """Store an upload once, keyed by content hash (sha256). Re-uploading the
@@ -313,20 +328,12 @@ async def upload_source(file: UploadFile = File(...)):
             raise HTTPException(400, "empty upload")
         sid = h.hexdigest()[:16]
         rec = {"id": sid, "name": file.filename or sid, "ext": ext, "size": size}
-        # Materialize the on-disk dir and register the source as ONE critical
-        # section, re-checking presence inside the lock. delete_source pops SOURCES
-        # and rmtree's the dir under this same LOCK, so serializing here means a dup
-        # upload can never register sid after a concurrent delete removed the dir
-        # (the old phantom): we either see the dir still present (reuse it) or gone
-        # (a delete just won -> recreate from tmp before registering).
-        with LOCK:
-            d = SOURCES_DIR / sid
-            if not d.exists():
-                d.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(tmp), str(d / ("video" + ext)))
-                (d / "meta.json").write_text(json.dumps(
-                    {"name": file.filename or sid, "ext": ext, "size": size}))
-            SOURCES[sid] = rec
+        # Materialize + register off the event loop: this section takes the blocking
+        # LOCK (shared with delete_source, which holds it across an rmtree). Acquiring
+        # it on the loop thread would freeze every SSE/async request for the delete's
+        # duration; a worker thread blocks alone. Still one critical section, so a dup
+        # upload can never register sid after a concurrent delete removed the dir.
+        await asyncio.to_thread(_materialize_source, sid, tmp, ext, file.filename or sid, size, rec)
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
@@ -470,6 +477,24 @@ def create_runs(payload: dict = Body(...)):
                      for it in items]}
 
 
+def _events_tick(gid: str, last: int):
+    """Snapshot a group's SSE payload under LOCK, off the event loop (via to_thread).
+    Returns None if the group is gone, (None, rev) if unchanged since `last`, or
+    (payload, rev) with a fresh payload. Keeps the loop thread from blocking on LOCK
+    while a delete holds it across an rmtree."""
+    with LOCK:
+        g = GROUPS.get(gid)
+        if not g:
+            return None
+        if g["rev"] == last:
+            return None, g["rev"]
+        payload = {k: g[k] for k in ("status", "stage", "progress", "message", "error")}
+        payload["runs"] = {rid: {"source_id": r["source_id"], "status": r["status"],
+                                 "result": r["result"], "seg": _seg_client(r.get("run_meta"))}
+                           for rid, r in g["runs"].items()}
+        return payload, g["rev"]
+
+
 @app.get("/api/runs/{gid}/events")
 async def events(gid: str):
     if gid not in GROUPS:
@@ -478,23 +503,13 @@ async def events(gid: str):
     async def gen():
         last = -1
         while True:
-            with LOCK:
-                g = GROUPS.get(gid)
-                if not g:
-                    break
-                if g["rev"] != last:
-                    last = g["rev"]
-                    payload = {k: g[k] for k in ("status", "stage", "progress", "message", "error")}
-                    payload["runs"] = {rid: {"source_id": r["source_id"], "status": r["status"],
-                                             "result": r["result"],
-                                             "seg": _seg_client(r.get("run_meta"))}
-                                       for rid, r in g["runs"].items()}
-                    status = g["status"]
-                else:
-                    payload = status = None
+            tick = await asyncio.to_thread(_events_tick, gid, last)
+            if tick is None:            # group gone
+                break
+            payload, last = tick
             if payload is not None:
                 yield f"data: {json.dumps(payload)}\n\n"
-                if status in ("done", "error"):
+                if payload["status"] in ("done", "error"):
                     break
             await asyncio.sleep(0.1)
 
