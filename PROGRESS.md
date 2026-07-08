@@ -6,6 +6,23 @@ repvis is a web tool that visualizes the **dense patch-feature geometry of a vid
 
 ## Rounds
 
+### 2026-07-08-backlog-zero
+- **목표**: parallel-sweep 라운드의 **fable-5 리뷰 사이클 완주**(발견→검증→수정) + **남은 백로그 4건 전부 소진** — 태스크 잔량 0 달성.
+- **Shipped**:
+  - `fix/same-rid-mutation-marker` **(major, 리뷰 발견)** — same-rid 동시 mutation에서 첫 완료자의 discard가 두 번째의 보호를 벗기던 구멍: LOCK 안 same-rid **409 가드**(segment/refit 양쪽) + RED/GREEN 증명된 회귀 테스트. (`628becd`)
+  - `fix/segcache-device-sig` **(major, 리뷰 발견)** — `_SegCache` sig에 device 포함 `(source_id, T, dev)`: device drift가 cross-device 500 대신 cold miss. (`628becd`)
+  - `fix/create-runs-registration-window` (minor, 리뷰 발견) — 소스 검증+mkdir+GROUPS 등록을 단일 LOCK 임계구역으로. (`628becd`)
+  - `spike/fp8-attention` — **fidelity 게이트 NO-GO 확정**: torchao full-FP8(속도 1.39–1.63x 후보)이 실사 클립에서 PCA subspace 4.7–7.5°(게이트 2°) / shared-basis ΔE p95 5.4–9.4(게이트 3) — cosine 0.99가 숨기는 basis-rotation 함정 실증. 게이트 러너 `scripts/fp8_gate_dinov2.py` 커밋. (`6dde2f1`)
+  - `perf/phase2-sam-decode-tail` — feats.f16 덤프를 SAM과 오버랩(비동기 writer + atomic replace): 덤프 잔여 5–6.5s→~1s, phase-2 wall −4–5s. NVDEC 프레임 재사용은 **정확성 근거로 기각**(NVDEC↔CPU 비트 불일치). 남은 레버 = SAM2 자체(~40s) → `perf/multi-gpu-sam`. (`c78ea48`)
+  - `feat/saliency-artifact-tokens` — median/MAD |z|>3.5 norm-outlier 필터로 flat-scene saliency argmax hijack 수정; 합성 fill_frame 회귀는 **본질적 트레이드오프로 수용**(무객체 gradient 클립). CPU 단위테스트 승격. (`f30136e`, `9c8184d`)
+  - `fix/auth-hardening` — /api/login per-IP 지수 백오프(5회→429), #t= fragment 무조건 제거, README Security 섹션. (`e0f3089`)
+  - `fix/autoseed-negative-gate` — **ruling**: negative 게이트 추가 대신 주장 강등("never worse"는 5-clip 경험적 결과) — eval에서 hole-free 실증 + 실세계 피해 증거 없음. docstring에 기록. (`9c8184d`)
+- **Gates**: CPU pytest **45/5skip**; ruff clean; same-rid 409 RED/GREEN; fp8 게이트 재현 2회 일치; tail 수정 masks byte-identical(비결정성 기저와 동일 크기); 리뷰 claim 5건 생존(분위수는 확장 fuzz까지).
+- **SSOT**: unchanged.
+- **Decisions pending**: none.
+- **Review**: requested (`docs/reviews/2026-07-08-backlog-zero-request.md`).
+- **Next**: 잔여 minor 4건 등록됨(`perf/multi-gpu-sam`, `chore/decode-codec-coverage`, `fix/stale-vfr-run-migration`, `perf/segcache-byte-budget`) — GPU 가용성/우선순위에 따라 착수. 라이브 서버 재시작(신규 auth/캐시/디코드 반영) 대기.
+
 ### 2026-07-08-parallel-sweep
 - **목표**: remediation 리뷰 ingest(신규 Major 1건) 처리 후 **남은 태스크 전량을 병렬로 소진** — 모든 산출물을 GPU 실측으로 검증해 병합/재작업/폐기 판정.
 - **Shipped**:
