@@ -62,9 +62,10 @@ _MAX_CACHED_RUNS = 2
 
 
 class _SegCache:
-    """LRU of run_id -> (Sam2VideoInferenceSession, sig). `sig` (source_id, T) is a
-    cheap guard: a hit whose signature no longer matches the run on disk is ignored
-    rather than reused, so a mismatched/stale session can never yield wrong masks.
+    """LRU of run_id -> (Sam2VideoInferenceSession, sig). `sig` (source_id, T, dev)
+    is a cheap guard: a hit whose signature no longer matches the run on disk (or
+    whose session was built on a different device) is ignored rather than reused, so
+    a mismatched/stale/cross-device session can never yield wrong masks.
 
     Touched by the single EXEC worker (populate, in segment_and_render) and by
     request threads (drop, on delete/refit/supersede); its own lock makes those
@@ -806,7 +807,7 @@ def segment_and_render(run_dir: Path, points: list, emit=None) -> dict:
     run_dir = Path(run_dir)
     meta, feats, state, dev, (gh, gw, D, T, fps, ow, oh) = _load_run(run_dir)
     run_id = run_dir.name
-    sig = (meta.get("source_id"), T)
+    sig = (meta.get("source_id"), T, dev)
 
     # Reuse a cached SAM2 session (decoded frames + vision features) for this run;
     # only a cold click decodes the source frames and builds one. The session is

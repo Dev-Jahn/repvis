@@ -336,6 +336,85 @@ def test_refit_404s_when_run_dir_absent(monkeypatch):
         assert e.status_code == 404
 
 
+def test_segment_same_rid_overlap_409s(monkeypatch):
+    """Two /segment calls on the SAME rid must not both hold the mutation marker.
+    While A is in flight (blocked in segment_and_render on the single worker, holding
+    the marker), a second /segment on that rid must 409 — otherwise A's finisher
+    `discard(rid)` strips protection while the second is still queued/running, letting
+    a delete/supersede rmtree the run dir mid-mutation."""
+    sid, rid = "1" * 16, "1" * 12
+    _fake_source(sid)
+    _fake_run(sid, rid)
+
+    started = threading.Event()
+    release = threading.Event()
+    a_result = {}
+
+    def _stub(run_dir, points, emit=None):
+        started.set()
+        release.wait(5)
+        return {"available": True, "empty": False, "points": []}
+
+    monkeypatch.setattr(srv, "segment_and_render", _stub)
+
+    def _a():
+        try:
+            a_result["ret"] = srv.run_segment(rid, {"points": [[1, 1, 1, 0]]})
+        except HTTPException as e:                    # pragma: no cover — A must succeed
+            a_result["err"] = e.status_code
+
+    # The second call runs in its own thread so the pre-fix path (which blocks on the
+    # busy single worker instead of 409-ing) yields a clean assertion failure, not a hang.
+    second = {"status": None}
+
+    def _b():
+        try:
+            srv.run_segment(rid, {"points": [[2, 2, 1, 0]]})
+        except HTTPException as e:
+            second["status"] = e.status_code
+
+    ath = threading.Thread(target=_a)
+    bth = threading.Thread(target=_b)
+    try:
+        ath.start()
+        assert started.wait(5), "thread A never entered the segment stub"
+        bth.start()                                   # A holds the marker; B must 409
+        bth.join(2)                                   # fix: instant 409; bug: blocks on EXEC
+        assert second["status"] == 409, "same-rid overlap was not rejected with 409"
+        release.set()
+        ath.join(5)
+        assert a_result.get("ret", {}).get("ok") is True, "in-flight segment A must complete ok"
+        assert rid not in srv.ACTIVE_RUN_MUTATIONS     # marker cleared afterwards
+    finally:
+        release.set()
+        ath.join(5)
+        bth.join(5)
+        _cleanup(sid, rid)
+
+
+def test_segcache_device_in_sig():
+    """FINDING 2: the SAM2 session cache keys on (source_id, T, dev). A warm entry
+    built on one device must MISS after device drift (so it rebuilds on the new device
+    rather than running new-device tensors against an old-device session) and HIT only
+    on the identical signature. LRU eviction + drop still behave."""
+    c = pl._SegCache(2)
+    sess = object()
+    c.put("r0", sess, ("s", 10, "cuda:0"))
+    assert c.get("r0", ("s", 10, "cuda:1")) is None    # device drift -> cold miss
+    assert c.get("r0", ("s", 10, "cuda:0")) is sess     # identical sig -> hit
+
+    # LRU eviction at maxsize=2: putting a 3rd run evicts the oldest (r0).
+    c.put("r1", object(), ("s", 10, "cuda:0"))
+    c.put("r2", object(), ("s", 10, "cuda:0"))
+    assert c.get("r0", ("s", 10, "cuda:0")) is None
+    assert c.get("r1", ("s", 10, "cuda:0")) is not None
+    assert c.get("r2", ("s", 10, "cuda:0")) is not None
+
+    # drop removes the entry.
+    c.drop("r2")
+    assert c.get("r2", ("s", 10, "cuda:0")) is None
+
+
 def test_race_dup_upload_vs_delete_source(monkeypatch):
     """Phantom-source barrier: a dup (identical-bytes) upload must not register sid
     into SOURCES after a concurrent delete_source popped it and rmtree'd the dir.

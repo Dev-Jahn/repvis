@@ -37,7 +37,10 @@ SOURCES: dict[str, dict] = {}   # source_id -> {id, name, ext, size}
 GROUPS: dict[str, dict] = {}    # group_id  -> live group/progress state
 LOCK = threading.Lock()
 # rids of in-flight /segment|/refit mutations (guarded by LOCK). Deletes and the
-# _persist_run supersede skip/refuse these so we never clobber a run mid-mutation.
+# _persist_run supersede skip/refuse these so we never clobber a run mid-mutation;
+# a second /segment|/refit on an rid already in-flight is rejected with 409 (a plain
+# set can't tell two same-rid mutations apart, so the first finisher would otherwise
+# discard the marker while the second is still queued/running on the single worker).
 ACTIVE_RUN_MUTATIONS: set[str] = set()
 # Serialize GPU work so a single group gets the whole machine (and we never OOM-race).
 EXEC = ThreadPoolExecutor(max_workers=1)
@@ -436,22 +439,25 @@ def create_runs(payload: dict = Body(...)):
     if not REGISTRY[model].is_available():
         raise HTTPException(400, f"model '{model}' weights are not available")
 
-    items = []
-    for sid in source_ids:
-        inp = _source_video(sid)
-        if not inp:
-            raise HTTPException(404, f"unknown source {sid}")
-        rid = uuid.uuid4().hex[:12]
-        rd = RUNS_DIR / rid
-        rd.mkdir(parents=True, exist_ok=True)
-        items.append({"run_id": rid, "source_id": sid, "input": inp, "out": rd / "pca.mp4"})
-
-    gid = uuid.uuid4().hex[:12]
-    runs = {it["run_id"]: {"run_id": it["run_id"], "source_id": it["source_id"],
-                           "status": "running", "result": None} for it in items}
-    group = {"id": gid, "model": model, "opts": opts, "status": "queued", "stage": "queued",
-             "progress": 0.0, "message": "Queued…", "error": None, "rev": 0, "runs": runs}
+    # Validate sources, mkdir the run dirs and register the group in ONE critical
+    # section: a concurrent delete_runs/delete_source can't rmtree a just-validated
+    # source or a nascent run dir between the check and the group going live.
     with LOCK:
+        items = []
+        for sid in source_ids:
+            inp = _source_video(sid)
+            if not inp:
+                raise HTTPException(404, f"unknown source {sid}")
+            rid = uuid.uuid4().hex[:12]
+            rd = RUNS_DIR / rid
+            rd.mkdir(parents=True, exist_ok=True)
+            items.append({"run_id": rid, "source_id": sid, "input": inp, "out": rd / "pca.mp4"})
+
+        gid = uuid.uuid4().hex[:12]
+        runs = {it["run_id"]: {"run_id": it["run_id"], "source_id": it["source_id"],
+                               "status": "running", "result": None} for it in items}
+        group = {"id": gid, "model": model, "opts": opts, "status": "queued", "stage": "queued",
+                 "progress": 0.0, "message": "Queued…", "error": None, "rev": 0, "runs": runs}
         GROUPS[gid] = group
 
     def task():
@@ -543,6 +549,8 @@ def run_segment(rid: str, payload: dict = Body(...)):
             raise HTTPException(404)
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
+        if rid in ACTIVE_RUN_MUTATIONS:
+            raise HTTPException(409, "this run is already being segmented/refit")
         ACTIVE_RUN_MUTATIONS.add(rid)
     try:
         seg = EXEC.submit(segment_and_render, rd, points).result()
@@ -577,6 +585,8 @@ def run_refit(rid: str):
             raise HTTPException(404)
         if _active_run_ids():
             raise HTTPException(409, "a run is in progress")
+        if rid in ACTIVE_RUN_MUTATIONS:
+            raise HTTPException(409, "this run is already being segmented/refit")
         ACTIVE_RUN_MUTATIONS.add(rid)
     try:
         seg = EXEC.submit(refit_and_render, rd).result()
