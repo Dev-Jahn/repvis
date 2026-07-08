@@ -6,6 +6,26 @@ repvis is a web tool that visualizes the **dense patch-feature geometry of a vid
 
 ## Rounds
 
+### 2026-07-08-parallel-sweep
+- **목표**: remediation 리뷰 ingest(신규 Major 1건) 처리 후 **남은 태스크 전량을 병렬로 소진** — 모든 산출물을 GPU 실측으로 검증해 병합/재작업/폐기 판정.
+- **Shipped**:
+  - `fix/delete-mutation-stale-snapshot` **(major)** — delete/supersede가 락 밖 rmtree로 mutation 중 run dir을 지우던 race를 **단일-LOCK 규율**로 봉합 + atomic meta.json; barrier 회귀 테스트 RED/GREEN 증명. (`d39ee3b`)
+  - `feat/endpoint-access-control` **(major)** — 공유 토큰(REPVIS_TOKEN) 미들웨어 + 브라우저 쿠키 플로우(미디어/SSE). 보안 3-lens 리뷰가 찾은 **이벤트루프 기아 Major**(async upload/SSE가 루프에서 blocking LOCK 획득)를 `asyncio.to_thread`로 수정. (`afefcb6`, `0dccb91`)
+  - `fix/vfr-decode-alignment` **(major)** — spike가 CPU로 입증(`9c266d5`)한 VFR 정렬 붕괴의 근인이 **phase-1 자체의 timestamp 기반 seek**임을 GPU로 확정(NVDEC는 sparse open-GOP에서 크래시까지); 양 경로가 공유하는 **positional no-seek primitive**(`video_io.iter_frames_at`)로 통일. E2E VFR centroid 오차 <4px, 단일-unit 디코드 2배 가속. (`34ce9dd`)
+  - `perf/sam-session-cache` — run별 SAM2 세션/비전피처 캐시: warm 클릭 **2.7x**(841ms), cold==warm masks byte-match, idle VRAM ~0. 단일-LOCK delete 경로에 `drop_seg_cache` 통합. (`e09c7d5`)
+  - `feat/sam-autoseed-quality` — 멀티포인트 시드에 **피처 유사도 게이트**(peak k≥2는 peak 1과 cosine 근접 시만) + border negative. 3-arm 검증: 회귀 0, fill_frame 0.407→0.9995. (`9ed7a52`)
+  - `perf/bench-giant-huge-compile` — 추정(~+15%)을 실측으로 대체: giant compile **1.09x**/fp8 **1.39x**, vith16plus compile **1.29x**/fp8 **1.63x** (sm_120, torchao). (`49ba297`)
+  - `fix/weighted-quantile-plotting-position` — weighted type-7 분위수(equal weights에서 `torch.quantile`과 동치) + `tests/test_pca.py`. (`04991fd`)
+  - `fix/upload-delete-source-phantom` — dup upload↔delete_source phantom race를 LOCK 임계구역으로 봉합. (`dc585d2`)
+  - `spike/frame-alignment-check` **(major)** — "정렬은 정확" 주장 검증: CFR(closed/open-GOP)은 성립, **VFR에서 붕괴** — `fix/vfr-decode-alignment` 파생. (`9c266d5`)
+  - `chore/push-remove-bg` — be04e13 push 확인 후 종료.
+- **Dropped**: `perf/parallel-joint-encode` — **측정 기반 폐기**: 1080p/1200f에서 인코드는 phase-2 87.7s의 ~3%(진짜 tail은 SAM2 64% + SAM용 CPU 디코드 17% + feats 덤프 ~14s). 실험은 `wip/parallel-joint-encode`에 보존, 후속 `perf/phase2-sam-decode-tail` 등록.
+- **Gates**: CPU pytest 41/5skip; GPU frame-alignment 24 pass + api 14 pass; delete-race fix RED/GREEN 증명; 적대 리뷰 3-lens×2회(동시성/보안 — 보안 리뷰가 Major 1건 적발·수정).
+- **SSOT**: unchanged.
+- **Decisions pending**: none.
+- **Review**: requested (`docs/reviews/2026-07-08-parallel-sweep-request.md`).
+- **Next**: `spike/fp8-attention` fidelity Phase 0/1, `perf/phase2-sam-decode-tail`, `fix/auth-hardening`, `feat/saliency-artifact-tokens` — 4건 병렬 진행 중(worktree).
+
 ### 2026-07-07-review-fixes
 - **목표**: gpt-5.5-pro 도메인 리뷰의 **REAL finding 5건 + refit 설계(ruling) + 공유 모델 로드 lock** 수정. 파일 단위 병렬 구현.
 - **Shipped** (`1262e15`):

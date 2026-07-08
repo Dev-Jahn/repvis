@@ -30,8 +30,9 @@ tasks:
     origin: "init"
     notes: "ratified by ADR-0000"
   - id: chore/push-remove-bg
+    round: 2026-07-08-parallel-sweep
     title: "Push the committed remove_bg robust-masking work (be04e13) to origin after a leak scan"
-    status: "done"
+    status: done
     origin: "PROGRESS loose ends"
   - id: fix/remove-bg-horizontal-planes
     title: "remove_bg classifies large horizontal planes (floor/desk) as foreground; revisit with a geometric/semantic prior"
@@ -45,18 +46,21 @@ tasks:
     status: "dropped"
     origin: "PROGRESS loose ends"
   - id: spike/fp8-attention
+    round: 2026-07-08-parallel-sweep
     notes: "Bench evidence (2026-07-07, GPU6): torchao full-FP8 linear already measured 1.39x (giant) / 1.63x (vith16plus) / 1.65x (vitb16) end-to-end forward on sm_120 — confirms the spike's FLOP analysis that full-FP8 (not attention-only, capped ~1.35x) is where the ~2x-class win lives, and that sm_120 fp8 scaled-mm kernels are real (not a bf16 fallback). Remaining work = the fidelity gate: Phase 0 noise floor + Phase 1 feature/PCA-color parity per docs/spikes/fp8-attention.md + scripts/fp8_fidelity.py before any server adoption."
     title: "Evaluate FP8 attention for a true ~2x forward speedup versus its fidelity risk (currently unshipped)"
     status: "pending"
     origin: "PROGRESS loose ends"
   - id: perf/bench-giant-huge-compile
+    round: 2026-07-08-parallel-sweep
     notes: "MEASURED (GPU6 sm_120, 1024px, torch 2.12.1+cu130, 20 iters): dinov2-giant baseline 992.5ms/32.2fps/7177MB -> compile 910.3ms/35.2fps/5306MB (1.09x) -> fp8 716.2ms/44.7fps/3873MB (1.39x). dinov3-vith16plus baseline 1376.9ms/46.5fps/8007MB -> compile 1066.4ms/60.0fps/5851MB (1.29x) -> fp8 841.8ms/76.0fps/5407MB (1.63x). Controls: vitb16 compile 1.48x/fp8 1.65x; large compile 1.10x. Verdict: giant compile ~+9% (below the ~+15% estimate; GEMM-bound like dinov2-large), vith16plus compile +29% (2x the estimate). torchao FP8 (Float8DynamicActivationFloat8WeightConfig) is the real win (1.39-1.63x + big VRAM cut) but is SPEED-only measured — PCA-color fidelity gate (spike/fp8-attention Phase 0/1) required before serving. Raw log: scripts/bench_backbone.py output 2026-07-07."
     title: "Benchmark FP8/compile gains for dinov2-giant and dinov3-vith16plus (huge+ compile gain is only estimated ~+15%)"
-    status: "done"
+    status: done
     origin: "PROGRESS loose ends"
   - id: feat/endpoint-access-control
+    round: 2026-07-08-parallel-sweep
     title: "Add access control to job/source endpoints; any reachable client that knows an id can currently fetch content"
-    status: "done"
+    status: done
     severity: "major"
     origin: "PROGRESS loose ends"
   - id: feat/per-cell-bg-threshold-refit
@@ -72,14 +76,16 @@ tasks:
     origin: "user pivot 2026-07-07"
     notes: "supersedes the mask half of feat/per-cell-bg-threshold-refit; keeps the Refit(색 재fit) button"
   - id: feat/sam-autoseed-quality
+    round: 2026-07-08-parallel-sweep
     notes: "DONE (9ed7a52), GPU-validated 3-arm (OLD/DRAFT/NEW): feature-similarity gate — extra positive peak k>=2 planted only if cosine-closer to peak 1's DINO feature than to the patch mean (relative criterion, no tuned threshold); border negative kept (proved hole-safe). No regression on any of 5 clips (hard_small_busy OLD 0.0435 vs NEW 0.0434 — draft ballooned to 0.5222); fill_frame fixed 0.407->0.9995; two_same_objects NEW 0.0315 = both squares (beats single-point). Known pre-existing residue -> feat/saliency-artifact-tokens."
     title: "Improve SAM2 auto-seed: single DINO-saliency point misses on some frames; try multi-point / better saliency / SAM auto-mask-gen fallback"
-    status: "done"
+    status: done
     origin: "round 2026-07-07"
   - id: perf/sam-session-cache
+    round: 2026-07-08-parallel-sweep
     notes: "GPU-validated PASS and MERGED (e09c7d5): warm re-seg masks.u1 byte-matches cold (sha256, 3 regimes) and different points give different masks (true re-segment, not stale replay); click latency cold 2285ms -> warm 841ms (2.72x on the validation clip; ~1.8x on the draft's larger clip); idle cached session ~0 VRAM (CPU-resident session), host-RAM ~260MB/run, LRU bound 2. Rebase onto main preserved the single-LOCK delete discipline (drop_seg_cache inside LOCK before each rmtree) and the atomic meta.json write. GPU no-clobber test retargeted to sam.segment_session (the refine path's actual callee post-refactor; assertion unchanged)."
     title: "Persist the Sam2VideoInferenceSession / vision features per run so +/- click re-segmentation skips recomputation and cuts click latency"
-    status: "done"
+    status: done
     origin: "round 2026-07-07"
   - id: fix/segment-click-frame-idx
     round: 2026-07-07-review-fixes
@@ -112,9 +118,9 @@ tasks:
     severity: "major"
     origin: "review-2026-07-07-sam2-foreground"
   - id: spike/frame-alignment-check
-    round: 2026-07-07-review-fixes
+    round: 2026-07-08-parallel-sweep
     title: "Verify 'frame alignment is exact': phase-1 GPU-decode vs SAM CPU re-decode both use seek_mode=approximate and tests only check index-length; add checksum/hash verification + open-GOP/VFR fixtures, or reuse one decode path"
-    status: "done"
+    status: done
     severity: "major"
     origin: "review-2026-07-07-sam2-foreground"
   - id: decision/refit-mask-grid-threshold
@@ -130,24 +136,28 @@ tasks:
     severity: "major"
     origin: "review-2026-07-07-sam2-foreground"
   - id: fix/delete-mutation-stale-snapshot
+    round: 2026-07-08-parallel-sweep
     title: "run-mutation mutex (fix/run-mutation-mutex) still races on a stale snapshot: DELETE /api/runs, DELETE /api/sources and _persist_run supersede compute skip/protected under LOCK then rmtree OUTSIDE it, so a segment/refit registered into ACTIVE_RUN_MUTATIONS after the snapshot has its run dir deleted mid-mutation (feats/meta/source rmtree'd under it). Make victim selection + mutation-registration atomic under LOCK (DELETING_RUNS/SOURCES set, or atomic-rename victims to .trash/<uuid> under lock then delete outside), move the feats.f16 precheck inside the lock block, and add a barrier concurrency regression test"
-    status: "done"
+    status: done
     severity: "major"
     origin: "review-2026-07-07-review-fixes"
   - id: fix/weighted-quantile-plotting-position
+    round: 2026-07-08-parallel-sweep
     title: "_weighted_quantile docstring claims it 'matches torch.quantile when weights are equal' but its midpoint plotting-position CDF (cw-0.5w)/cw_n = (i-0.5)/n differs from torch.quantile's type-7 linear i/(n-1) at small token counts (e.g. n=16,q=0.02 clamps to the min while torch interpolates xs[0..1]); refit display range is then more outlier-sensitive on small fg masks. Either make the weighted quantile reduce to torch.quantile at equal weights or correct the docstring's equivalence claim"
-    status: "done"
+    status: done
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
   - id: fix/upload-delete-source-phantom
+    round: 2026-07-08-parallel-sweep
     title: "Duplicate upload racing DELETE /api/sources can re-register a source whose dir was just rmtree'd: upload_source's (SOURCES_DIR/sid).exists() check + dir handling run OUTSIDE LOCK and only SOURCES[sid]=rec is locked, so an identical-bytes re-upload taking the else-branch can insert sid into SOURCES after delete_source popped it and rmtree'd the dir -> phantom source (list/workspace advertise it, create_runs 404s) until a restart re-scan. Pre-existing; surfaced by review-2026-07-07-review-fixes adversarial pass"
-    status: "done"
+    status: done
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
   - id: fix/vfr-decode-alignment
+    round: 2026-07-08-parallel-sweep
     notes: "FIXED & GPU-validated (34ce9dd). Root cause was deeper: phase-1 itself was timestamp-based (NVDEC get_frames_at approximate). Fix: shared positional no-seek primitive video_io.iter_frames_at (sequential torchcodec._core.get_next_frame, pre-roll skip, positional select, end-clamp) used by BOTH GpuVideoSource and _decode_source_frames. Validated: 24 GPU frame-alignment tests (cross-backend identity on closed/open-GOP, VFR, trim), E2E VFR moving-square centroid err <4px (1-frame off would be >=50px), GPU api suite 14 passed. Perf: single-unit decode 2x faster; 4-unit parallel -28% (prefix re-decode, still above extraction speed). Risks: private torchcodec API (pinned 0.14.0, guarded by test); VFR runs made before this fix should be re-run; multi-unit prefix re-decode."
     title: "Frame alignment is NOT exact on VARIABLE-FRAME-RATE sources: seek_mode=approximate maps index->timestamp via AVERAGE fps, so phase-1 NVDEC feats and SAM CPU re-decode can resolve different frames per index on VFR (CPU-proven in tests/test_frame_alignment.py; CFR closed/open-GOP are fine). seek_mode=exact crashes on stream-copy-trimmed uploads so is not an option. Fix: single decode path (decode sampled frames once, reuse for feats+SAM) or guarantee identical backend+seek. First GPU-validate NVDEC-vs-CPU divergence on the VFR fixture per the spike's plan"
-    status: "done"
+    status: done
     severity: "major"
     origin: "spike/frame-alignment-check"
   - id: fix/auth-hardening
