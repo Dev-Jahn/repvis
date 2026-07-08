@@ -176,18 +176,21 @@ tasks:
     severity: "minor"
     origin: "feat/sam-autoseed-quality"
   - id: fix/same-rid-mutation-marker
+    notes: "FIXED (628becd): 409 on rid already in ACTIVE_RUN_MUTATIONS in both run_segment and run_refit (inside LOCK, before add). Regression test test_segment_same_rid_overlap_409s with RED/GREEN proof (pre-fix: second call blocks on EXEC and never 409s; post-fix: instant 409 while first is in flight)."
     title: "ACTIVE_RUN_MUTATIONS is a set with no same-rid guard: two concurrent /segment|/refit on the SAME rid both pass the LOCK checks (only _active_run_ids is 409'd), and the first finisher's finally discard(rid) strips protection while the second is still queued/executing on EXEC -> delete_runs/delete_source/_persist_run can rmtree the run dir under the in-flight mutation (executable repro in review; worst case a partially resurrected zombie run dir). Fix: 409 when rid already in ACTIVE_RUN_MUTATIONS (both endpoints) + same-rid overlap regression test"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-08-parallel-sweep"
   - id: fix/segcache-device-sig
+    notes: "FIXED (628becd): sig=(source_id,T,dev) — device drift is now a cold miss (rebuild on new device, old entry LRU-ages out). Unit test test_segcache_device_in_sig (miss on dev mismatch, hit on identical sig, LRU+drop)."
     title: "_SegCache sig (source_id,T) omits the device: sessions are pinned to their build-time GPU (Sam2VideoInferenceSession moves inputs to inference_device) while segment_and_render re-picks dev=select_devices()[0] per call, so a warm hit after device drift runs dev_new model x dev_old session -> cross-device RuntimeError -> 500 (fail-fast, masks never wrong; self-heals cold; invisible on single-GPU pin). Fix: sig=(source_id,T,dev) so drift is a cold miss + unit test"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-08-parallel-sweep"
   - id: fix/create-runs-registration-window
+    notes: "FIXED (628becd): source validation + run-dir mkdir + GROUPS registration folded into one LOCK critical section; EXEC.submit stays outside."
     title: "create_runs validates sources and mkdirs run dirs BEFORE registering the group in GROUPS under LOCK: a delete_runs/delete_source in that window rmtrees the nascent run dirs / just-validated source (graceful group error, no corruption - task finally cleans up). Move validation+mkdir+registration into one LOCK critical section"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-2026-07-08-parallel-sweep"
   - id: fix/autoseed-negative-gate
