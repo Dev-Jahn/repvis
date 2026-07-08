@@ -47,9 +47,9 @@ tasks:
     origin: "PROGRESS loose ends"
   - id: spike/fp8-attention
     round: 2026-07-08-parallel-sweep
-    notes: "Bench evidence (2026-07-07, GPU6): torchao full-FP8 linear already measured 1.39x (giant) / 1.63x (vith16plus) / 1.65x (vitb16) end-to-end forward on sm_120 — confirms the spike's FLOP analysis that full-FP8 (not attention-only, capped ~1.35x) is where the ~2x-class win lives, and that sm_120 fp8 scaled-mm kernels are real (not a bf16 fallback). Remaining work = the fidelity gate: Phase 0 noise floor + Phase 1 feature/PCA-color parity per docs/spikes/fp8-attention.md + scripts/fp8_fidelity.py before any server adoption."
+    notes: "CLOSED with a definitive NO-GO (6dde2f1): torchao full-FP8 (the 1.39-1.63x deployment candidate) fails the fidelity gate on REAL footage — PCA subspace rotates 4.7-7.5deg (gate 2deg; bf16<->fp16 floor 0.7-1.9), shared-basis delta-E p95 5.4-9.4 (gate 3; floor 2-3.2), refit path worse (8.5-10) — the basis-rotation trap (cosine stays 0.99) the spike doc predicted. Numerics result, kernel-independent; eager==compiled rounding. Gate runner committed: scripts/fp8_gate_dinov2.py; results appended to docs/spikes/fp8-attention.md. Future: mixed-precision FP8 (render-feeding blocks bf16) re-gateable with the same script."
     title: "Evaluate FP8 attention for a true ~2x forward speedup versus its fidelity risk (currently unshipped)"
-    status: "pending"
+    status: "done"
     origin: "PROGRESS loose ends"
   - id: perf/bench-giant-huge-compile
     round: 2026-07-08-parallel-sweep
@@ -161,18 +161,21 @@ tasks:
     severity: "major"
     origin: "spike/frame-alignment-check"
   - id: fix/auth-hardening
+    notes: "DONE (e0f3089): per-IP exponential-backoff throttle on /api/login (5 tries -> 429+Retry-After, window doubles from 1s cap 300s, reset on success), unconditional #t= fragment strip in index.html, README Security section (REPVIS_TOKEN, cleartext/SSH-tunnel/TLS guidance, lockout). Throttle test with monkeypatched clock. Scoped: per-process state, request.client.host IP (proxy caveat documented)."
     title: "Auth hardening follow-ups from review-2026-07-07 security pass (all minor, single-user LAN tool): POST /api/login has no rate-limit/backoff so REPVIS_TOKEN is brute-forceable; token+cookie travel cleartext over HTTP (no Secure/TLS) — document TLS/SSH-tunnel requirement or add optional TLS; static/index.html leaves the #t= URL fragment unstripped in open mode (strip regardless)."
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-2026-07-07-review-fixes"
   - id: perf/phase2-sam-decode-tail
+    notes: "DONE (c78ea48): feats.f16 dump now overlaps SAM segmentation via a background writer (tmp + atomic os.replace, stricter than before) — dump remainder 5-6.5s -> ~1s, phase-2 wall -4-5s (scales with frame count). NVDEC-frame-reuse for SAM RULED OUT on correctness: NVDEC vs CPU decode not byte-identical (max abs 2, ~58% px) so masks would change. Masks byte-identical across new-path runs; async-vs-sync diffs = pre-existing SAM GPU nondeterminism magnitude. Remaining lever: SAM2 itself (~40s, 64-72%) -> multi-GPU SAM parallelism (needs >1 free GPU)."
     title: "Attack the REAL phase-2 tail found by the encode premise-check profile (1080p/1200f: SAM2 56.1s = 64%, CPU source re-decode for SAM 15.2s = 17%, feats.f16 dump ~14s vs encode ~3%): parallelize SAM2 across GPUs or reuse phase-1 decoded frames for SAM (single-decode already shared post-vfr-fix), overlap the feats dump with render, and/or move SAM decode off CPU"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "perf/parallel-joint-encode"
   - id: feat/saliency-artifact-tokens
+    notes: "DONE (f30136e + unit test): robust median/MAD modified z-score (Iglewicz-Hoaglin |z|>3.5, two-sided) excludes norm-outlier tokens from the positive-peak argmax — both hijacked flat clips fixed (object |z|~1, artifacts 3.6-19.7). ACCEPTED TRADEOFF: synthetic fill_frame control regressed 0.9995->0.286 — inherent (its coverage depended on seeding on the very artifact token being suppressed; degenerate no-object gradient, not a real-world case). CPU unit test tests/test_autoseed.py added."
     title: "Auto-seed primary peak can land on background on near-uniform scenes: DINOv2-base high-norm artifact tokens hijack the saliency argmax (pre-existing, seen identically in OLD and NEW seeds during autoseed validation); suppress high-norm outlier tokens before the argmax or prefer a registers model"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "feat/sam-autoseed-quality"
   - id: fix/same-rid-mutation-marker
@@ -194,8 +197,9 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-08-parallel-sweep"
   - id: fix/autoseed-negative-gate
+    notes: "RULING (autonomous, reviewer option ii): claim downgraded instead of adding a symmetric negative gate — the counterexample clip class (subject filling frame to borders) was observed HOLE-FREE in eval with the negative ON the subject (SAM treats it as edge refinement), fill_frame is synthetic-degenerate, and gating would churn just-validated behavior with no real-world evidence of harm. _auto_seed docstring now records the residual and that 'never worse than single-point' is an empirical 5-clip result, not an invariant. Reopen if a real clip shows a negative-point hole."
     title: "Reviewer open question: the auto-seed border NEGATIVE prompt is planted ungated - on a subject filling the frame to the borders, patch mean ~= subject prototype forces the lowest-saliency border patch ONTO the subject (a constructed counterexample to the 'never worse than single-point' claim; the n=5 eval had one fill_frame clip). Either gate the negative symmetrically (plant only if its feature is cosine-closer to mean than to peak 1) or downgrade the claim to the empirical 5-clip statement; decide after feat/saliency-artifact-tokens lands (same function)"
-    status: "pending"
+    status: "done"
     severity: "minor"
     deps: ["feat/saliency-artifact-tokens"]
     origin: "review-2026-07-08-parallel-sweep"

@@ -373,7 +373,12 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
     they blanket the subject rather than clustering on one peak, plus one NEGATIVE
     prompt at the least-salient patch on the frame border (the border ring is
     background far more often than not — a safer anchor than a global minimum that
-    could land on a flat patch inside a frame-filling subject).
+    could land on a flat patch inside a frame-filling subject). Known residual
+    (review 2026-07-08, kept by decision): the negative is planted UNGATED, so on
+    a subject that fills the frame to the borders it can sit ON the subject; the
+    eval observed this exact case hole-free (SAM treats it as edge refinement), so
+    "never worse than the single-point seed" is an empirical 5-clip result, not an
+    invariant.
 
     Extra positives are GATED (GPU-validated: ungated they regress busy-background
     clips — the k>=2 saliency peaks land on salient background and pull it INTO
