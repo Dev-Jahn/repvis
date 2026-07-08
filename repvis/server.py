@@ -209,6 +209,32 @@ def _emit(group: dict, **kw):
 AUTH_COOKIE = "repvis_token"
 _AUTH_EXEMPT = frozenset({"/", "/api/login", "/api/auth"})
 
+# In-process brute-force throttle for POST /api/login. After LOGIN_MAX_TRIES wrong
+# tokens from one client IP, further attempts are refused with 429 for an
+# exponentially growing window (doubling from 1s, capped); a correct login clears
+# the counter. Single-user tool — enough to make wordlist scripts impractical, not
+# a full WAF. The constant-time token compare still runs on every allowed attempt.
+LOGIN_MAX_TRIES = 5
+_LOGIN_LOCK = threading.Lock()
+_login_state: dict[str, list] = {}   # ip -> [fail_count, locked_until]
+
+
+def _login_retry_after(ip: str) -> float:
+    """Seconds the caller must still wait before another attempt, else 0.0."""
+    with _LOGIN_LOCK:
+        st = _login_state.get(ip)
+        return max(0.0, st[1] - time.time()) if st else 0.0
+
+
+def _login_failed(ip: str):
+    """Record a wrong-token attempt and (re)arm the backoff window past threshold."""
+    with _LOGIN_LOCK:
+        st = _login_state.setdefault(ip, [0, 0.0])
+        st[0] += 1
+        if st[0] >= LOGIN_MAX_TRIES:
+            st[1] = time.time() + min(2.0 ** (st[0] - LOGIN_MAX_TRIES), 300.0)
+
+
 if not AUTH_TOKEN:
     print("repvis: REPVIS_TOKEN is not set — running WITHOUT access control; "
           "every source video, run and API route is publicly reachable.",
@@ -253,12 +279,20 @@ def login(request: Request, payload: dict = Body(default={})):
     token = AUTH_TOKEN
     if not token:
         return {"ok": True, "required": False}
+    ip = request.client.host if request.client else "?"
+    wait = _login_retry_after(ip)
+    if wait > 0:
+        return JSONResponse({"detail": "too many attempts"}, status_code=429,
+                            headers={"Retry-After": str(math.ceil(wait))})
     body_tok = payload.get("token")
     ok = ((body_tok is not None
            and secrets.compare_digest(str(body_tok).encode(), token.encode()))
           or _authorized(request, token))
     if not ok:
+        _login_failed(ip)
         raise HTTPException(401, "invalid token")
+    with _LOGIN_LOCK:
+        _login_state.pop(ip, None)   # success resets the backoff
     resp = JSONResponse({"ok": True})
     resp.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="strict", path="/")
     return resp

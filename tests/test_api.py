@@ -544,6 +544,38 @@ def test_login_cookie_flow(auth_on):
         _cleanup(sid, rid)
 
 
+def test_login_bruteforce_throttled(auth_on):
+    # rapid wrong-token logins from one IP hit 429 once the failure threshold is
+    # crossed; the constant-time compare still runs on every *allowed* attempt.
+    attacker = TestClient(srv.app, client=("203.0.113.7", 5000))
+    try:
+        # attempts 1..N are wrong -> 401 (still processed); the Nth arms the lock
+        for _ in range(srv.LOGIN_MAX_TRIES):
+            assert attacker.post("/api/login", json={"token": "wrong"}).status_code == 401
+        # the next attempt is refused outright, with a Retry-After hint
+        blocked = attacker.post("/api/login", json={"token": "wrong"})
+        assert blocked.status_code == 429
+        assert int(blocked.headers["retry-after"]) >= 1
+        # even the *correct* token is refused while the same IP is locked out
+        assert attacker.post("/api/login", json={"token": TOKEN}).status_code == 429
+
+        # a correct login from a different IP is unaffected by the attacker's lockout
+        other = TestClient(srv.app, client=("198.51.100.9", 5000))
+        assert other.post("/api/login", json={"token": TOKEN}).status_code == 200
+
+        # once the backoff window elapses, the locked IP can log in again with the
+        # right token (patch time forward instead of sleeping the real window)
+        real_time = time.time
+        srv.time.time = lambda: real_time() + 3600
+        try:
+            assert attacker.post("/api/login", json={"token": TOKEN}).status_code == 200
+        finally:
+            srv.time.time = real_time
+    finally:
+        with srv._LOGIN_LOCK:
+            srv._login_state.clear()
+
+
 def test_auth_disabled_is_open():
     prev = srv.AUTH_TOKEN
     srv.AUTH_TOKEN = None            # disabled (the default for the whole suite)

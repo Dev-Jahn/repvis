@@ -110,17 +110,19 @@
     s.src = "/static/app.js";
     document.body.appendChild(s);
   }
+  // Capture and strip the token fragment first, unconditionally — never leave it
+  // in the URL (history/bookmarks/referrer) even when auth turns out to be off.
+  let token = null;
+  const m = location.hash.match(/(?:^#|&)t=([^&]+)/);
+  if (m) {                                      // token passed in the URL fragment
+    token = decodeURIComponent(m[1]);
+    history.replaceState(null, "", location.pathname + location.search);
+  }
   let required = false;
   try { required = (await (await fetch("/api/auth")).json()).required; }
   catch { loadApp(); return; }                 // server unreachable: let app.js report it
   if (!required) { loadApp(); return; }         // auth disabled: no login needed
 
-  let token = null;
-  const m = location.hash.match(/(?:^#|&)t=([^&]+)/);
-  if (m) {                                      // token passed in the URL fragment
-    token = decodeURIComponent(m[1]);
-    history.replaceState(null, "", location.pathname + location.search);  // don't leave it in the URL
-  }
   for (;;) {
     if (!token) token = prompt("Enter the repvis access token:");
     if (!token) return;                         // cancelled: leave the shell empty

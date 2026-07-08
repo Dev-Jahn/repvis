@@ -81,6 +81,22 @@ mid-run re-attaches to the in-flight job's progress. Re-running a (source, model
 cell replaces its previous result. **Clear** deletes all results from the server
 (sources are kept).
 
+## Security
+
+Access control is off by default (a solo, LAN/localhost tool). Set **`REPVIS_TOKEN`**
+to a shared secret to gate everything — every API route, source video, run video and
+the SSE stream require the token (via `Authorization: Bearer`, an `X-Repvis-Token`
+header, or the `repvis_token` cookie that `POST /api/login` sets). With it unset the
+server runs open and prints a startup warning that all content is publicly reachable.
+
+The token and its cookie travel **in cleartext over plain HTTP**, so `REPVIS_TOKEN`
+alone does not make the server safe to expose directly on an untrusted network. For
+remote access, keep it bound to localhost and reach it through an **SSH tunnel**
+(`ssh -L 8000:127.0.0.1:8000 host`) or put it behind a **TLS-terminating reverse
+proxy** (nginx/caddy). Repeated wrong tokens at `POST /api/login` are throttled per
+client IP: after 5 failures the endpoint returns **429** for an exponentially growing
+window (a correct login clears it), so online password-guessing is impractical.
+
 ## Performance & memory
 
 **Everything stays on the GPU end to end** — there is no CPU pixel path. Frames
