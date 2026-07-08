@@ -571,6 +571,44 @@ def _bake_encode(chunks: list, state, masks: torch.Tensor, out_path, ow: int, oh
             pt.join()
 
 
+def _dump_feats_async(chunks: list, run_dir: Path, g: _Group):
+    """Write feats.f16 (fp16, C-contiguous, frame order) on a background thread so
+    the multi-GB disk dump OVERLAPS SAM segmentation (GPU-bound, CPU idle) instead of
+    stalling the render ahead of it. The write lands on a temp file that is atomically
+    os.replace()d onto feats.f16, so a crash never leaves a partial file (same
+    no-partial-write discipline as _replace_video).
+
+    Holds its OWN references to `chunks` (list copy) so the concurrent _bake_encode
+    may free the shared list (chunks[i] = None) without racing the write; the fp16
+    tensors are read-only to both, so the two concurrent readers are safe. Peak host
+    RAM is unchanged (the whole cache is already resident here), and the writer
+    finishes during the decode+SAM phase, long before _bake_encode starts freeing.
+
+    Returns (thread, err_list); the caller MUST join the thread and, if err_list is
+    non-empty, re-raise err_list[0] before treating the run as complete."""
+    refs = list(chunks)                       # survive _bake_encode's in-place frees
+    err: list[BaseException] = []
+    tmp = run_dir / "feats.f16.tmp"
+
+    def _write():
+        try:
+            with open(tmp, "wb") as fh:
+                for c in refs:
+                    if g.cancel.is_set():
+                        raise _Cancel()
+                    fh.write(c.numpy().tobytes())
+            os.replace(tmp, run_dir / "feats.f16")
+        except BaseException as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            err.append(e)
+            if not isinstance(e, _Cancel):
+                g.fail(e)
+
+    t = threading.Thread(target=_write, daemon=True)
+    t.start()
+    return t, err
+
+
 def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
     """Persist this source's dense features + PCA state, auto-seed + run SAM2
     foreground segmentation, then encode the PCA video with the mask baked in."""
@@ -582,19 +620,24 @@ def _render_source(src: dict, state, dev: str, g: _Group, emit_done):
     for u in src["units"]:
         u["cache"] = None
 
-    # full dense features -> disk (fp16, C-contiguous, frame order) for later refit
-    with open(run_dir / "feats.f16", "wb") as fh:
-        for c in chunks:
-            fh.write(c.numpy().tobytes())
-
-    # auto-seed from frame-0 grid saliency, decode source frames, run SAM2
+    # auto-seed from frame-0 grid saliency (reads chunks[0] before _bake_encode frees it)
     points = _auto_seed(chunks[0][0], meta["width"], meta["height"])
-    frames_np = _decode_source_frames(src["input"], src["indices"])
-    masks, seg = _segment(frames_np, points, dev, oh, ow)
-    del frames_np
 
-    _bake_encode(chunks, state, masks, src["out"], ow, oh, src["fps_out"], dev, g,
-                 tick=g.tick_render)
+    # Decode the source frames FIRST (single-threaded CPU decode). Only then launch
+    # the feats.f16 dump, so its multi-GB write overlaps SAM + encode (GPU-bound, CPU
+    # idle) rather than contending with the CPU decode for memory bandwidth.
+    frames_np = _decode_source_frames(src["input"], src["indices"])
+    writer, werr = _dump_feats_async(chunks, run_dir, g)
+    try:
+        masks, seg = _segment(frames_np, points, dev, oh, ow)
+        del frames_np
+        _bake_encode(chunks, state, masks, src["out"], ow, oh, src["fps_out"], dev, g,
+                     tick=g.tick_render)
+    finally:
+        writer.join()               # feats.f16 fully written+replaced before we finish
+    if werr:
+        raise werr[0]               # disk write failed -> propagate (render_worker -> g.fail)
+
     _save_masks(run_dir, masks)
     torch.save(state.to("cpu"), run_dir / "state.pt")
     emit_done(src, seg)
