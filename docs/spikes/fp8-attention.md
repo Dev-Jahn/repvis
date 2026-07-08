@@ -261,3 +261,119 @@ def fp8_attention(q, k, v, scale_qk):        # q,k,v: (B,H,N,d) bf16
 days, kills the idea fast if numerics don't survive PCA). Only commit to the
 Phase-2 kernel/speed work — and the "2×" framing — after Phase 1 passes and sm_120
 fp8-kernel support is confirmed. Do not ship on cosine similarity alone.
+
+---
+
+## 7. RESULTS — Phase 0 + Phase 1 measured (2026-07, sm_120, GPU5)
+
+**VERDICT: NO-GO — serving torchao full-FP8 on DINOv2 fails the fidelity gate.**
+The full-FP8 config the backbone bench measured at 1.39–1.65× (giant / vith16plus
+/ vitb16) rotates the top-3 PCA basis and remaps the rendered colors far beyond
+the free-variance floor, on *real footage*, not just synthetic clips. This kills
+FP8 for the largest serving models on fidelity grounds *independent* of whether a
+faster fused kernel exists.
+
+**What changed vs the doc plan.** The backbone bench proved torchao full-FP8
+linear (`Float8DynamicActivationFloat8WeightConfig` + compile) runs *real* sm_120
+fp8 kernels (not a bf16 fallback) at 1.4–1.65×, so the deployment candidate is
+**full-FP8**, and the gate was run against that first. The attention-only
+`_scaled_mm` probe (§2 path A) is now secondary and was not needed: full-FP8 is a
+strict *superset* perturbation and it already fails decisively, so the cheaper
+attention-only variant — which does not reach the 2× that would justify the risk
+anyway — was not pursued.
+
+**Harness.** Offline metrics unchanged (`scripts/fp8_fidelity.py`, self-test
+passes). Added the GPU-side driver `scripts/fp8_gate_dinov2.py`: drives
+dinov2-base through `repvis.extract._Extractor` under bf16×2 / fp16 / torchao
+full-FP8 on identical clips, then renders the dumped features through the real
+`repvis.pca` path (`fit_pca_state`→`project_chunk`, plus the few-token
+`refit_display`) so the color numbers are what the user sees. Four clips: two real
+(1080p + 720p natural footage) and two lavfi (mandelbrot, testsrc2). 8 consecutive
+frames each (also gives the temporal delta). dinov2-base only, grid 41×73 = 2993
+tokens at the server's `max_side=1024` cap.
+
+### Phase 0 — noise floor (calibration)
+
+Two bf16 forwards in-process are **bit-identical** (the forward is deterministic;
+`cudnn.benchmark` picks the same algo), so bf16-self-noise is exactly 0 on every
+metric — the self-floor is zero. The meaningful floor is **bf16↔fp16**, two dtypes
+`extract.py` already treats as interchangeable (`_pre` comment: "negligible output
+diff ≤1e-3"). That floor already **grazes or exceeds the doc's static gates**:
+
+| metric | doc gate | fp16 floor (worst clip) | at the gate? |
+|---|---|---|---|
+| cosine mean | ≥ 0.9995 | 0.99864 | slightly under |
+| cosine p1 | ≥ 0.995 | 0.97677 | under |
+| subspace max deg | ≤ 2.0 | 2.48 (testsrc2) | over on synthetic |
+| ΔE shared p95 | ≤ 3.0 | 6.85 (testsrc2) | over on synthetic |
+| ΔE own p95 | ≤ 3.0 | 9.87 (testsrc2) | over on synthetic |
+
+So the doc's absolute thresholds are **tighter than a bf16→fp16 swap** — exactly
+the case §5 said to handle by loosening honestly. The synthetic **testsrc2** clip
+has a near-degenerate PCA basis (flat color-bar content → near-tied singular
+values), which inflates its `own-basis` ΔE for *any* perturbation, so the
+own-basis ΔE on synthetic content is a re-parameterization artifact, not error.
+The robust, content-independent floor comes from the **real** clips:
+
+| fp16 floor, REAL clips | cosine mean | cosine p1 | subspace deg | ΔE shared p95 | ΔE own p95 |
+|---|---|---|---|---|---|
+| real-1080p | 0.99864 | 0.9768 | 1.89 | 3.15 | 3.45 |
+| real-720p | 0.99913 | 0.9906 | 0.74 | 1.95 | 1.99 |
+
+**Recalibrated pass band (what fp8 must clear):** to count as no-worse-than a
+dtype swap, fp8 must stay within roughly the real-clip fp16 floor —
+cosine ≳ 0.9986, subspace ≲ 2°, ΔE(shared) p95 ≲ 3–3.5, ΔE(own) p95 ≲ 3.5.
+
+### Phase 1 — torchao full-FP8 candidate (vs bf16 baseline)
+
+Per-clip, `Float8DynamicActivationFloat8WeightConfig()` over every `nn.Linear`
+(per-row dynamic act + weight scaling — the *good* config, not per-tensor):
+
+| clip | cosine mean | cosine p1 | subspace deg | refit deg | ΔE shared p95 | ΔE own p95 | refit ΔE p95 |
+|---|---|---|---|---|---|---|---|
+| **real-1080p** | 0.98908 | 0.9232 | **7.46** | 3.94 | **9.40** | 9.74 | 10.08 |
+| **real-720p** | 0.99169 | 0.9463 | **4.74** | 3.99 | **5.39** | 6.52 | 8.52 |
+| mandelbrot | 0.98434 | 0.9109 | 9.13 | 8.69 | 9.82 | 13.20 | 14.44 |
+| testsrc2 | 0.98552 | 0.8994 | 16.49 | 6.82 | 21.93 | 142.54 | 15.54 |
+
+**Read on the real clips alone** (ignore synthetic entirely): fp8 is a consistent
+**3–4× worse than the fp16 floor on every metric** — subspace rotates **4.7–7.5°**
+(floor 0.7–1.9°, gate 2°), ΔE(shared, fixed basis) **p95 5.4–9.4** (floor 2–3.2,
+gate 3), cosine mean **0.989–0.992** (floor 0.999). The `refit_display` few-token
+path is worse still (refit ΔE p95 8.5–10). The 142 ΔE on testsrc2 is a basis
+sign-flip discontinuity (the doc's exact "silently swaps colors" failure, pushed
+past a component inversion by the coarse E4M3 mantissa) — dramatic but not needed
+for the verdict; the real footage fails on its own. Temporal flicker rises modestly
+(cand 7.47 vs base 6.65 mean frame-to-frame ΔE) — a secondary concern behind the
+static color remap.
+
+**Why:** full-FP8's ~2-decimal-digit E4M3 activations, accumulated across 12 ViT
+blocks, perturb the feature covariance enough that the top-3 SVD basis feeding the
+render rotates several degrees. Because color = projection onto that basis, the
+render's hues shift globally and visibly — while per-token cosine still reads 0.98+
+(exactly the trap §3 and the harness self-test warn about). This is structural
+bias, not washable noise.
+
+### Go/No-Go
+
+- **NO-GO** for serving torchao full-FP8 on DINOv2 (base measured; giant/large
+  share the family numerics and add *more* fp8 GEMMs → no reason to expect better,
+  and they are the models whose speed motivated this). The 1.4–1.65× is real but
+  the PCA-render fidelity cost is not acceptable: users would see remapped colors.
+- **NO-GO stands regardless of a fused kernel** — this is a numerics result about
+  fp8 feeding an SVD, not a kernel/speed result. Phase 2 (fused FA3/TE) is moot
+  for full-FP8.
+- **Attention-only FP8** (softmax + linears stay bf16; only the two BMMs go fp8)
+  is a strictly smaller perturbation and *might* clear the gate, but per §1 it
+  caps at ~1.15–1.35× and never reaches 2×, so it is not worth a kernel effort;
+  not pursued in this spike.
+- If FP8 is ever revisited for pure throughput where color fidelity is negotiable,
+  it would need mixed precision (keep the last few blocks / the layers feeding the
+  render in bf16) re-gated with `scripts/fp8_gate_dinov2.py` — out of scope here.
+
+Reproduce:
+```
+CUDA_VISIBLE_DEVICES=5 HF_HOME=/var/cache/huggingface uv run --with torchao \
+  python scripts/fp8_gate_dinov2.py \
+  --video samples/test.mp4:120 --video sources/<id>/video.mp4:15
+```
