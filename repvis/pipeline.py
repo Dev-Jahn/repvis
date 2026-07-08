@@ -362,6 +362,12 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
     outlying patch, which can be a lone background distractor (a sign, a specular
     highlight) or a subject edge — so SAM2 missed the subject on some frames.
 
+    Before the argmax, artifact patch tokens are removed from the positive-peak
+    candidates: register-less ViTs emit a few gross norm-outlier tokens carrying
+    global (not local) information that otherwise hijack the argmax onto background
+    on near-uniform scenes. They are identified by a robust median/MAD outlier test
+    on the frame's patch-norm distribution — a relative criterion (see below).
+
     Instead seed SAM2 with up to `k` POSITIVE prompts at the highest-saliency
     patches, spread apart by non-maximum suppression (radius ~ 1/6 of the grid) so
     they blanket the subject rather than clustering on one peak, plus one NEGATIVE
@@ -386,6 +392,20 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
     mu = x.mean(0)                                      # background prototype (D,)
     sal = (x - mu).norm(dim=1).reshape(gh, gw)          # (gh, gw)
 
+    # Register-less ViTs (DINOv2) emit a few artifact patch tokens whose L2 norm is
+    # a gross outlier — high-norm globals that carry scene-level, not local, info,
+    # plus symmetric low-norm degenerate tokens. Both sit far from the scene mean,
+    # so they win the saliency argmax and plant the primary (+) prompt on background
+    # even on near-uniform scenes. Drop any patch whose norm is an extreme outlier
+    # of the frame's patch-norm distribution (robust median/MAD modified z-score,
+    # Iglewicz-Hoaglin |z| > 3.5) from the positive-peak candidates. Relative, no
+    # tuned norm threshold; a spread-less frame (MAD = 0) flags nothing.
+    norms = x.norm(dim=1)
+    med = norms.median()
+    mad = (norms - med).abs().median()
+    artifact = ((0.6745 * (norms - med) / mad).abs() > 3.5 if mad > 0
+                else torch.zeros_like(norms, dtype=torch.bool))
+
     def _to_px(row: int, col: int) -> tuple[float, float]:
         return ((col + 0.5) / gw * float(width), (row + 0.5) / gh * float(height))
 
@@ -393,6 +413,7 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
     # same-object gated (see docstring) — peak 1 is always kept
     rad = max(1, round(min(gh, gw) / 6))
     work = sal.clone()
+    work.reshape(-1)[artifact] = float("-inf")          # never seed on an artifact
     f1 = None                                           # primary peak's feature
     pts: list[tuple[float, float, int, int]] = []
     for _ in range(max(1, k)):
