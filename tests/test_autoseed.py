@@ -10,6 +10,7 @@ import tempfile
 # Redirect sources/ + runs/ away from the repo before repvis.config is imported.
 os.environ.setdefault("REPVIS_DATA_DIR", tempfile.mkdtemp(prefix="repvis-test-"))
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from repvis.pipeline import _auto_seed  # noqa: E402
@@ -72,3 +73,44 @@ def test_uniform_frame_negative_never_shares_cell_with_a_positive():
     neg = {cell(x, y) for (x, y, lab, _f) in pts if lab == 0}
     assert pos                                      # a primary positive is always planted
     assert pos & neg == set()                       # no cell carries both (+) and (-)
+
+
+@pytest.mark.xfail(strict=True, reason="known limitation: the two-sided MAD filter "
+                   "excludes norm-outlier real subjects; policy fix tracked as "
+                   "fix/autoseed-outlier-subject-coverage — needs GPU eval")
+def test_norm_outlier_real_subject_is_wrongly_excluded():
+    """Characterization of the real-subject-exclusion risk. A SMALL, spatially
+    coherent REAL foreground (2x2 blob) whose token norms are themselves gross
+    outliers gets dropped by the two-sided median/MAD artifact filter alongside the
+    genuine register-token artifacts, so the primary (+) peak lands on background
+    instead of the subject — the filter can't tell a norm-outlier artifact token from
+    a norm-outlier real subject.
+
+    Regime: background is one direction with a deterministic norm spread (med = 1.0,
+    MAD ~ 0.06); the blob is a distinct DIRECTION *and* a gross norm outlier — all
+    four cells measure |z| ~ 11.2 (>> 3.5), so the filter provably flags them. DESIRED
+    behavior (asserted, xfails on current code): the primary positive lands ON the
+    blob. Today the blob is excluded from the candidates, so it can't."""
+    gh = gw = 8
+    D = 16
+    base = torch.zeros(D)
+    base[0] = 1.0                                   # background direction
+    obj = torch.zeros(D)
+    obj[1] = 1.0                                    # subject direction (distinct)
+    grid = torch.empty(gh, gw, D)
+    for r in range(gh):                             # background: deterministic norm
+        for c in range(gw):                         # spread so MAD > 0 (~0.06)
+            grid[r, c] = base * (1.0 + 0.02 * ((r * gw + c) % 11 - 5))
+    blob = {(3, 3), (3, 4), (4, 3), (4, 4)}         # coherent 2x2 real subject: a
+    for r, c in blob:                               # distinct DIRECTION *and* a gross
+        grid[r, c] = obj * 2.0                      # norm outlier (|z| ~ 11.2 > 3.5)
+
+    W, H = 640, 360
+    pts = _auto_seed(grid, W, H)
+
+    def cell(px, py):
+        return int(py / H * gh), int(px / W * gw)
+
+    pos = [cell(x, y) for (x, y, lab, _f) in pts if lab == 1]
+    assert pos                                      # a primary positive is planted
+    assert pos[0] in blob                           # DESIRED: primary lands on subject
