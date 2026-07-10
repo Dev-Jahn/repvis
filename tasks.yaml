@@ -230,3 +230,18 @@ tasks:
     status: "pending"
     severity: "minor"
     origin: "review-2026-07-08-parallel-sweep"
+  - id: perf/sparse-decode-full-walk
+    title: "Positional sequential decode walks the whole stream to the last sampled index — and each of the up-to-4×ndev units re-walks its prefix from frame 0, and SAM re-decode does a second full CPU walk — so max_frames sparse sampling no longer bounds decode work on long videos; restore bounded decode (candidate: exact-scan-indexed access where provably positional-equivalent, sequential walk otherwise) without giving up the single positional index definition"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-08-backlog-zero"
+  - id: fix/autoseed-outlier-subject-coverage
+    title: "The MAD norm filter's 'never excludes a real subject' claim is only tested on the artifact side: add a fixture where a small high-contrast REAL foreground is itself a norm outlier (and a textureless close-up), and decide the policy if the subject is demonstrably excludable; also skip/relocate the border negative if it collides with a positive cell"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-08-backlog-zero"
+  - id: chore/feats-writer-fault-injection
+    title: "Fault-injection test for the async feats.f16 writer's least-exercised branch: writer thread raises mid-dump — assert the run fails cleanly (no torn feats.f16, no leaked thread, tmp file cleaned up)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-08-backlog-zero"
