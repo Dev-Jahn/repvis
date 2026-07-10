@@ -231,17 +231,26 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-08-parallel-sweep"
   - id: perf/sparse-decode-full-walk
-    title: "Positional sequential decode walks the whole stream to the last sampled index — and each of the up-to-4×ndev units re-walks its prefix from frame 0, and SAM re-decode does a second full CPU walk — so max_frames sparse sampling no longer bounds decode work on long videos; restore bounded decode (candidate: exact-scan-indexed access where provably positional-equivalent, sequential walk otherwise) without giving up the single positional index definition"
+    round: 2026-07-10-router-refuted
+    title: "Positional sequential decode walks the whole stream (and per-unit prefixes, and a second full CPU walk for SAM) so max_frames sparse sampling no longer bounds decode work on long videos. Probe-gated exact-indexed routing was implemented then REFUTED by adversarial review (index-set-dependent silent misalignment on spliced sources; see wip/exact-decode-router + the splice characterization test). Remaining sound directions: (a) per-(file,indices,chunking) full-comparison certification enabling exact only for byte-verified REPEAT SAM re-decodes, (b) one sequential decode pass per source fanned out to units (kills the prefix re-walk multiplier, no trust in seeks needed), (c) overlap the SAM CPU walk under phase-1 GPU work for initial runs"
     status: "pending"
     severity: "major"
     origin: "review-2026-07-08-backlog-zero"
   - id: fix/autoseed-outlier-subject-coverage
+    round: 2026-07-10-router-refuted
     title: "The MAD norm filter's 'never excludes a real subject' claim is only tested on the artifact side: add a fixture where a small high-contrast REAL foreground is itself a norm outlier (and a textureless close-up), and decide the policy if the subject is demonstrably excludable; also skip/relocate the border negative if it collides with a positive cell"
     status: "pending"
     severity: "minor"
     origin: "review-2026-07-08-backlog-zero"
   - id: chore/feats-writer-fault-injection
+    round: 2026-07-10-router-refuted
     title: "Fault-injection test for the async feats.f16 writer's least-exercised branch: writer thread raises mid-dump — assert the run fails cleanly (no torn feats.f16, no leaked thread, tmp file cleaned up)"
-    status: "pending"
+    status: done
     severity: "minor"
     origin: "review-2026-07-08-backlog-zero"
+  - id: fix/exact-decode-silent-misalignment
+    round: 2026-07-10-router-refuted
+    title: "Probe-gated exact-indexed decode silently misaligns on mid-stream-discontinuous sources (splice/reconnect): torchcodec exact get_frames_at resolution is INDEX-SET-dependent (dense correct, sparse strides collapse onto the pre-splice frame, no exception), so no fixed probe set can certify the production index set — contain by removing the exact routing (router preserved on wip/exact-decode-router), add a splice fixture + characterization test recording the refutation"
+    status: done
+    severity: "blocker"
+    origin: "adversarial-verify-2026-07-10"

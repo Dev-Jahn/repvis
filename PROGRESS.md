@@ -6,6 +6,19 @@ repvis is a web tool that visualizes the **dense patch-feature geometry of a vid
 
 ## Rounds
 
+### 2026-07-10-router-refuted
+- **목표**: backlog-zero 라운드의 gpt-5.5-pro 패킷 리뷰 ingest(REAL major 1 + minor 2) 처리 — minor 2건 수정, major(sparse-decode 계약)는 측정 캠페인 → hybrid 구현 → **적대적 검증에 의한 기각**까지 한 사이클.
+- **Shipped**:
+  - `chore/feats-writer-fault-injection` (minor, 리뷰 발견) — async feats writer의 mid-dump 실패 분기 fault-injection 테스트: 에러 전파 / torn final 불가 / tmp 정리 / thread join 4계약 전부 실코드로 검증, 버그 0. (`1ddd767`)
+  - `fix/exact-decode-silent-misalignment` **(blocker, 적대적 검증 발견)** — 아래 Refuted 참조. 격리 = 라우터 제거 + splice fixture를 alignment 불변식 전체에 편입 + dense-correct/sparse-wrong 특성화 테스트. (`c5c0ef6`)
+  - `fix/autoseed-outlier-subject-coverage` **일부** (minor, 리뷰 발견, 태스크 잔존) — uniform 프레임에서 (+)/(−)가 같은 cell에 겹치던 충돌 가드(RED/GREEN) + norm-outlier real-subject 배제를 strict xfail로 특성화(blob \|z\|≈11.2가 필터에 걸림을 실증). 필터 정책 변경은 GPU eval 필요로 열어 둠. (`6ab758a`, `d1bf08f`)
+- **Refuted**: `perf/sparse-decode-full-walk`의 후보 해법 **probe-gated exact-indexed 디코드 라우터**. GPU 측정 캠페인(NVDEC exact의 crash 축은 트림이 아니라 **open-GOP**, 메타데이터로 감지 불가, exact scan ~40ms, sparse fetch 최대 ~2x/10x)으로 설계·구현·전 suite green(CPU 61, GPU 39)까지 갔으나, **적대적 리뷰가 재현 가능한 반증 제시**: torchcodec exact `get_frames_at`의 frame resolution이 **index-set 의존** — splice(concat/reconnect) 소스에서 dense 요청은 전부 정확한데 sparse stride 요청만 pre-splice frame으로 **무음 붕괴**(probe 자신의 set은 정확) → 어떤 고정 probe로도 production index set을 증명할 수 없음. 위험 클래스(dashcam/VOD 장편)가 정확히 최적화 대상 클래스. 구현·측정·probe 설계는 `wip/exact-decode-router`에 보존; main은 positional 유일 정의로 복귀. 태스크는 건전 방향 3개로 재정의: (a) 반복 SAM re-decode 한정 (file,indices,chunking) full-비교 인증, (b) 소스당 단일 decode pass fan-out(prefix 재walk 배수 제거), (c) SAM CPU walk을 phase-1 GPU 작업에 중첩.
+- **Gates**: CPU pytest **52/6skip/1xfail**; GPU frame-alignment **29 pass**(splice 파라미터 포함); ruff clean; blocker 반증 스크립트 2종 직접 재실행으로 확정; same-cell 가드 RED/GREEN; 적대적 리뷰 attacks-survived 목록(강등 의미론, tail-clamp 패리티, 동시성 self-healing) 확보.
+- **SSOT**: unchanged.
+- **Decisions pending**: none.
+- **Review**: requested (`docs/reviews/2026-07-10-router-refuted-request.md`).
+- **Next**: `perf/sparse-decode-full-walk`(재정의된 3방향, GPU 가용 시), 잔여 minor 4건(`perf/multi-gpu-sam`, `chore/decode-codec-coverage`, `fix/stale-vfr-run-migration`, `perf/segcache-byte-budget`), 라이브 서버 재시작 대기(REPVIS_TOKEN 결정 필요).
+
 ### 2026-07-08-backlog-zero
 - **목표**: parallel-sweep 라운드의 **fable-5 리뷰 사이클 완주**(발견→검증→수정) + **남은 백로그 4건 전부 소진** — 태스크 잔량 0 달성.
 - **Shipped**:
