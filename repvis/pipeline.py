@@ -421,6 +421,7 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
     work.reshape(-1)[artifact] = float("-inf")          # never seed on an artifact
     f1 = None                                           # primary peak's feature
     pts: list[tuple[float, float, int, int]] = []
+    pos_cells: list[tuple[int, int]] = []               # grid cells holding a positive
     for _ in range(max(1, k)):
         row, col = divmod(int(work.argmax()), gw)
         if work[row, col].isneginf():             # grid exhausted by suppression
@@ -433,13 +434,22 @@ def _auto_seed(grid0: torch.Tensor, width: int, height: int, *,
             continue                              # different object — don't plant it
         px, py = _to_px(row, col)
         pts.append((px, py, 1, 0))
+        pos_cells.append((row, col))
 
-    # negative prompt: least-salient patch on the frame border (dominant background)
+    # negative prompt: least-salient patch on the frame border (dominant background),
+    # excluding any cell that already holds a positive — otherwise a degenerate exactly
+    # -uniform frame (flat saliency: positive argmax and border argmin both pick cell
+    # (0, 0)) plants a (+) and a (-) on the SAME cell. If every border cell holds a
+    # positive (k <= 5, practically impossible), plant no negative. The negative is
+    # otherwise still UNGATED (a nearby cell / a cell on the subject stays allowed).
     border = torch.ones(gh, gw, dtype=torch.bool)
     border[1:-1, 1:-1] = False
-    row, col = divmod(int(sal.masked_fill(~border, float("inf")).argmin()), gw)
-    px, py = _to_px(row, col)
-    pts.append((px, py, 0, 0))
+    for r, c in pos_cells:
+        border[r, c] = False
+    if border.any():
+        row, col = divmod(int(sal.masked_fill(~border, float("inf")).argmin()), gw)
+        px, py = _to_px(row, col)
+        pts.append((px, py, 0, 0))
     return pts
 
 

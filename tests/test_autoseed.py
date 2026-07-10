@@ -48,3 +48,27 @@ def test_norm_outlier_token_never_seeds_the_primary_point():
     assert cell(*pos[0]) in {(3, 3), (3, 4), (4, 3), (4, 4)}
     # no positive prompt lands on the artifact cell
     assert all(cell(x, y) != (0, 7) for (x, y) in pos)
+
+
+def test_uniform_frame_negative_never_shares_cell_with_a_positive():
+    """Degenerate exactly-uniform frame: every patch is identical, so saliency is
+    flat (MAD = 0, nothing flagged), the positive argmax picks cell (0, 0), and the
+    least-salient border cell (border argmin) is ALSO (0, 0). A single grid cell must
+    never carry contradictory (+) and (-) prompts, so the border negative must skip
+    any cell already holding a positive and land on a positive-free border cell (or,
+    if none is free, be dropped). Guards the same-cell collision only — the negative
+    staying otherwise ungated (allowed on a nearby cell / on the subject) is unchanged."""
+    gh = gw = 8
+    D = 16
+    grid = torch.ones(gh, gw, D)                    # exactly uniform: flat, MAD = 0
+
+    W, H = 640, 360
+    pts = _auto_seed(grid, W, H)
+
+    def cell(px, py):
+        return int(py / H * gh), int(px / W * gw)
+
+    pos = {cell(x, y) for (x, y, lab, _f) in pts if lab == 1}
+    neg = {cell(x, y) for (x, y, lab, _f) in pts if lab == 0}
+    assert pos                                      # a primary positive is always planted
+    assert pos & neg == set()                       # no cell carries both (+) and (-)
