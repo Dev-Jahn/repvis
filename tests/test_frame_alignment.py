@@ -79,15 +79,45 @@ def _stream_copy_trim(src, path):
           "-c", "copy", str(path)])
 
 
+def _midstream_splice(path, size=SIZE):
+    """Mid-stream discontinuity: a clean open-GOP segment concatenated with a
+    mid-GOP `-ss -c copy` trim of a second (hue-shifted) segment, concat-demuxed
+    with `-c copy`. The trim begins inside a GOP, so the spliced-in segment carries
+    dangling references / imperfect PTS across the join — the shape of a naively
+    cut-and-joined upload. On this class, exact-indexed seek resolves frames near
+    the splice INDEX-SET-dependently (see the characterization test at the bottom);
+    the positional walk resolves every frame correctly."""
+    a = path.with_name(path.stem + "_a.mp4")
+    b = path.with_name(path.stem + "_b.mp4")
+    bt = path.with_name(path.stem + "_bt.mp4")
+    lst = path.with_name(path.stem + "_concat.txt")
+    x264 = "keyint=12:min-keyint=12:scenecut=0:open_gop=1:bframes=3:b-pyramid=normal"
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+          "-i", f"testsrc2=size={size}:rate=10", "-t", "2",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-x264-params", x264,
+          "-fps_mode", "cfr", str(a)])
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+          "-i", f"testsrc2=size={size}:rate=10", "-t", "3", "-vf", "hue=h=120",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-x264-params", x264,
+          "-fps_mode", "cfr", str(b)])
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "0.75", "-i", str(b),
+          "-c", "copy", str(bt)])
+    lst.write_text(f"file '{a.resolve()}'\nfile '{bt.resolve()}'\n")
+    _run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+          "-i", str(lst), "-c", "copy", str(path)])
+
+
 @pytest.fixture(scope="session")
 def fixtures(tmp_path_factory):
     d = tmp_path_factory.mktemp("align")
     paths = {"baseline": d / "baseline.mp4", "opengop": d / "opengop.mp4",
-             "vfr": d / "vfr.mp4", "sscopy": d / "sscopy.mp4"}
+             "vfr": d / "vfr.mp4", "sscopy": d / "sscopy.mp4",
+             "splice": d / "splice.mp4"}
     _closed_gop_cfr(paths["baseline"])
     _open_gop_cfr(paths["opengop"])
     _vfr(paths["vfr"])
     _stream_copy_trim(paths["opengop"], paths["sscopy"])
+    _midstream_splice(paths["splice"])
     return paths
 
 
@@ -122,8 +152,12 @@ def _phase1_frames(path, indices, device="cpu"):
     return np.concatenate(out, 0)
 
 
-ALL = ["baseline", "opengop", "vfr", "sscopy"]
+ALL = ["baseline", "opengop", "vfr", "sscopy", "splice"]
 CFR = ["baseline", "opengop"]
+# splice is deliberately excluded from EXACT_OK: exact seek RUNS on it (dense
+# [0..n) even resolves correctly) but silently misaligns on the sparse index sets
+# test_positional_matches_exact_seek uses, so positional and exact disagree there
+# by design (test_exact_seek_silently_misaligns_on_splice pins this).
 EXACT_OK = ["baseline", "opengop", "vfr"]   # exact seek crashes on sscopy
 
 
@@ -226,6 +260,40 @@ def test_exact_seek_crashes_on_stream_copy_trim(fixtures):
         _decode(path, idx, "exact")
 
 
+def test_exact_seek_silently_misaligns_on_splice(fixtures):
+    """REFUTATION RECORD (task fix/exact-decode-silent-misalignment): why a
+    probe-gated exact-indexed decode fast path is unsound.
+
+    torchcodec exact-mode `get_frames_at` resolution near a mid-stream splice is
+    INDEX-SET-dependent. On this concat-spliced source a DENSE [0..n) list resolves
+    every frame correctly with no exception, yet a SPARSE strided list silently
+    collapses the first post-splice indices onto the last clean pre-splice frame
+    (observed: indices 20, 22, 24 -> frame 18) — no error raised. Head frames (0,1)
+    and even a {0, 1, mid, tail} probe sample resolve correctly on some variants, so
+    NO fixed probe index set can certify that a DIFFERENT production `compute_indices`
+    set resolves correctly.
+
+    That is exactly why the probe-gated exact-indexed router (branch
+    wip/exact-decode-router) was refuted and removed: a passing probe cannot prove
+    the production index set is aligned. The positional walk (video_io.iter_frames_at)
+    resolves every index correctly on this class — pinned by the ALL-parametrized
+    invariant tests above — and remains the ONLY frame-selection mechanism for both
+    the phase-1 feature decode and the SAM re-decode.
+    """
+    path = fixtures["splice"]
+    atl = _atlas(path)
+    n = _nframes(path)
+    # DENSE [0..n): exact seek runs (no exception) and resolves every frame correctly.
+    dense = _decode(path, list(range(n)), "exact")
+    assert all(np.array_equal(dense[i], atl[i]) for i in range(n)), \
+        "exact seek should resolve a DENSE index set correctly on the splice"
+    # SPARSE strided: at least one index silently resolves to the WRONG frame.
+    idx = list(range(0, n, 2))
+    sparse = _decode(path, idx, "exact")
+    misaligned = [i for k, i in enumerate(idx) if not np.array_equal(sparse[k], atl[i])]
+    assert misaligned, "expected exact seek to SILENTLY misalign on a sparse index set"
+
+
 # ---- GPU: cross-BACKEND identity (NVDEC phase-1 vs CPU SAM re-decode) -------
 
 @GPU
@@ -246,6 +314,8 @@ def test_nvdec_phase1_matches_cpu_sam_decode(tmp_path_factory, kind):
         _open_gop_cfr(path, size)
     elif kind == "vfr":
         _vfr(path, size)
+    elif kind == "splice":
+        _midstream_splice(path, size)
     else:
         src = d / "opengop-src.mp4"
         _open_gop_cfr(src, size)
