@@ -292,6 +292,15 @@ def test_exact_seek_silently_misaligns_on_splice(fixtures):
     sparse = _decode(path, idx, "exact")
     misaligned = [i for k, i in enumerate(idx) if not np.array_equal(sparse[k], atl[i])]
     assert misaligned, "expected exact seek to SILENTLY misalign on a sparse index set"
+    # Pin the MECHANISM, not just byte divergence: every misaligned output is a real
+    # frame COLLAPSE — it byte-matches an EARLIER atlas frame (the last clean
+    # pre-splice frames), not a decode artifact that matches no source frame.
+    for k, i in enumerate(idx):
+        if np.array_equal(sparse[k], atl[i]):
+            continue
+        resolved = [j for j in range(n) if np.array_equal(sparse[k], atl[j])]
+        assert resolved and max(resolved) < i, \
+            f"index {i}: expected collapse onto an earlier frame, resolved={resolved}"
 
 
 # ---- GPU: cross-BACKEND identity (NVDEC phase-1 vs CPU SAM re-decode) -------
