@@ -232,7 +232,7 @@ tasks:
     origin: "review-2026-07-08-parallel-sweep"
   - id: perf/sparse-decode-full-walk
     round: 2026-07-10-router-refuted
-    title: "Positional sequential decode walks the whole stream (and per-unit prefixes, and a second full CPU walk for SAM) so max_frames sparse sampling no longer bounds decode work on long videos. Probe-gated exact-indexed routing was implemented then REFUTED by adversarial review (index-set-dependent silent misalignment on spliced sources; see wip/exact-decode-router + the splice characterization test). Remaining sound directions: (a) per-(file,indices,chunking) full-comparison certification enabling exact only for byte-verified REPEAT SAM re-decodes, (b) one sequential decode pass per source fanned out to units (kills the prefix re-walk multiplier, no trust in seeks needed), (c) overlap the SAM CPU walk under phase-1 GPU work for initial runs"
+    title: "Positional sequential decode walks the whole stream (plus per-unit prefix re-walks and a second full CPU walk for SAM), so max_frames sparse sampling no longer bounds decode work on long videos. Probe-gated exact-indexed routing REFUTED (index-set-dependent silent misalignment; wip/exact-decode-router + splice characterization test). Reviewer-endorsed order: FIRST (c) overlap the SAM CPU walk under phase-1 (measure D2H/host-bandwidth contention, cap per-source RGB accumulation on joint runs); THEN (b) one decode pass per source with topology-aware fan-out (P2P copy / host bounce / single-GPU fallback, CUDA events + record_stream, measure on real 1/2/4/8-GPU topology); (a) exact-replay certification only as a narrow auxiliary — boolean sidecar insufficient: store per-frame positional output hashes keyed by full content hash + exact ordered batch partition + decoder lifecycle + backend, and re-verify exact output against the hashes on EVERY replay (invalidate on mismatch); measure _SegCache miss rate first since certification only pays on eviction/refit/restart"
     status: "pending"
     severity: "major"
     origin: "review-2026-07-08-backlog-zero"
@@ -254,3 +254,8 @@ tasks:
     status: done
     severity: "blocker"
     origin: "adversarial-verify-2026-07-10"
+  - id: chore/splice-test-pin-collapse-mapping
+    title: "The splice characterization test asserts only byte-divergence (>=1 sparse index != atlas) — strengthen it to pin the MECHANISM: each misaligned sparse output must byte-match an EARLIER atlas frame (collapse onto the pre-splice region), distinguishing real frame collapse from a hypothetical reconstruction-byte artifact"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-10-router-refuted"
